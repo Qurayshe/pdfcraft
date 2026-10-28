@@ -104,7 +104,7 @@ fn summary(r: &OptimizeReport) -> String {
     let lang = crate::i18n::current();
     let mut parts = Vec::new();
     if o.pages_flattened > 0 {
-        parts.push(format!("{} slides flattened", o.pages_flattened));
+        parts.push(crate::i18n::trn(lang, o.pages_flattened as u64, "{n} slide flattened", "{n} slides flattened"));
     }
     let images = o.images_resampled + o.images_recompressed;
     if images > 0 {
