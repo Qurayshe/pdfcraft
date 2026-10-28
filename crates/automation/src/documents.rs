@@ -285,8 +285,15 @@ impl Automation {
         let path = self.resolve(a.str("path")?, true)?;
         let mut settings = match a.opt_str("preset")? {
             None => Preset::Standard.settings(),
-            Some(p) => Preset::from_name(p).ok_or_else(|| ToolError::InvalidArgs(format!("unknown preset {p:?} (standard, mobile)")))?.settings(),
+            Some(p) => Preset::from_name(p).ok_or_else(|| ToolError::InvalidArgs(format!("unknown preset {p:?} (standard, mobile, presentation)")))?.settings(),
         };
+        if let Some(v) = a.get("target_mb") {
+            let mb = v.as_f64().ok_or_else(|| ToolError::InvalidArgs("target_mb must be a number".into()))?;
+            if mb <= 0.0 {
+                return Err(ToolError::InvalidArgs(format!("target_mb must be positive, got {mb}")));
+            }
+            settings.target_mb = Some(mb as f32);
+        }
         if let Some(c) = a.opt_str("compatibility")? {
             settings.compatibility = Compatibility::from_name(c)
                 .ok_or_else(|| ToolError::InvalidArgs(format!("unknown compatibility {c:?} (retain, 1.4, 1.5, 1.6, 1.7, 2.0)")))?;

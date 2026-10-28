@@ -314,7 +314,7 @@ fn set_only_xobject(doc: &mut Document, page: ObjRef, name: &[u8], image: ObjRef
             doc.update_dict(page, |p| p.set(b"Resources".to_vec(), Object::Dict(d)))?;
         }
         _ => {
-            let mut d = Dict::new();
+            let mut d = crate::images::page_resources(doc, page).unwrap_or_default();
             d.set(b"XObject".to_vec(), Object::Ref(x_ref));
             doc.update_dict(page, |p| p.set(b"Resources".to_vec(), Object::Dict(d)))?;
         }
@@ -465,6 +465,36 @@ mod tests {
     #[test]
     fn premultiplied_pixels_go_over_white() {
         assert_eq!(rgb_over_white(&[10, 20, 30, 255, 0, 0, 0, 0, 50, 50, 50, 128]), vec![10, 20, 30, 255, 255, 255, 177, 177, 177]);
+    }
+
+    #[test]
+    fn inherited_resources_are_kept_when_page_has_no_own_resources() {
+        let mut doc = Document::new_empty();
+        let font_ref = doc.add(Object::Dict(Dict::new()));
+        let mut font_dict = Dict::new();
+        font_dict.set(b"F1".to_vec(), Object::Ref(font_ref));
+        let mut pages_res = Dict::new();
+        pages_res.set(b"Font".to_vec(), Object::Dict(font_dict));
+
+        let mut pages_dict = Dict::new();
+        pages_dict.set(b"Type".to_vec(), Object::name("Pages"));
+        pages_dict.set(b"Resources".to_vec(), Object::Dict(pages_res));
+        let pages_ref = doc.add(Object::Dict(pages_dict));
+
+        let mut page_dict = Dict::new();
+        page_dict.set(b"Type".to_vec(), Object::name("Page"));
+        page_dict.set(b"Parent".to_vec(), Object::Ref(pages_ref));
+        let page_ref = doc.add(Object::Dict(page_dict));
+
+        let img_ref = doc.add(Object::Dict(Dict::new()));
+        set_only_xobject(&mut doc, page_ref, b"PCFlat", img_ref).unwrap();
+
+        let page_obj = doc.get(page_ref);
+        let res = page_obj.as_dict().unwrap().get(b"Resources").unwrap();
+        let resolved = doc.resolve(res);
+        let res_dict = resolved.as_dict().unwrap();
+        assert!(res_dict.get(b"Font").is_some(), "inherited Font must survive");
+        assert!(res_dict.get(b"XObject").is_some(), "XObject must be set");
     }
 }
 

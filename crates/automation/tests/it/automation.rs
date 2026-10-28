@@ -6353,6 +6353,11 @@ fn a_page_printed_in_strips_gets_small_through_tools() {
     // The merged page opens and renders.
     let mobile = ok(&mut a, "doc_open", json!({ "path": "mobile.pdf" }))["doc"].as_u64().unwrap();
     assert!(a.call("page_render", &json!({ "doc": mobile, "page": 1, "dpi": 72 })).is_ok());
+    let pres = ok(&mut a, "doc_optimize", json!({ "doc": doc, "path": "presentation.pdf", "preset": "presentation" }));
+    assert!(pres["bytes_after"].as_u64().unwrap() < pres["bytes_before"].as_u64().unwrap(), "{pres}");
+    let target = ok(&mut a, "doc_optimize", json!({ "doc": doc, "path": "target.pdf", "target_mb": 5.0 }));
+    assert!(target["bytes_after"].as_u64().unwrap() <= 5 * 1024 * 1024, "{target}");
+    assert!(matches!(a.call("doc_optimize", &json!({ "doc": doc, "path": "x.pdf", "target_mb": 0.0 })), Err(ToolError::InvalidArgs(_))));
     assert!(matches!(a.call("doc_optimize", &json!({ "doc": doc, "path": "x.pdf", "preset": "tiny" })), Err(ToolError::InvalidArgs(_))));
 }
 

@@ -99,15 +99,23 @@ impl OptimizeJob {
         let mut step = |stage| if progress(stage) { Ok(()) } else { Err(EditError::Cancelled) };
         step(OptimizeStage::Discarding)?;
         let discarded = if discard.is_empty() { Vec::new() } else { pdfcraft_redact::sanitize::remove_hidden(&mut cos, &discard)? };
+        let mut active_trial: Option<(usize, usize)> = None;
         let report = optimize::optimize_with_progress(&mut cos, &settings, &mut |s| {
-            step(match s {
+            let stage = match s {
+                optimize::Stage::Trial { n, of } => {
+                    active_trial = Some((n, of));
+                    OptimizeStage::Trial { step: n, total: of }
+                }
+                _ if active_trial.is_some() => {
+                    let (step, total) = active_trial.unwrap_or((1, 1));
+                    OptimizeStage::Trial { step, total }
+                }
                 optimize::Stage::Fragments => OptimizeStage::Fragments,
                 optimize::Stage::Flatten { done, total } => OptimizeStage::Flattening { done, total },
                 optimize::Stage::Images { done, total } => OptimizeStage::Images { done, total },
-                optimize::Stage::Trial { n, of } => OptimizeStage::Trial { step: n, total: of },
                 optimize::Stage::CleanUp => OptimizeStage::CleaningUp,
-            })
-            .is_ok()
+            };
+            step(stage).is_ok()
         })
         .map_err(|e| match e {
             optimize::OptimizeError::Cancelled => EditError::Cancelled,

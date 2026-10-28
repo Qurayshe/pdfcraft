@@ -485,17 +485,25 @@ pub(crate) fn decodable(doc: &Document, s: &Stream) -> Option<bool> {
     let dct = is_dct(s);
     Some(
         dct.is_some()
-            && s.dict.get(b"Decode").is_none_or(|d| is_identity_decode(doc, d, n))
+            && s.dict.get(b"Decode").is_none_or(|d| is_identity_decode(doc, d, n, 1.0))
             && (n != 3 || dct == Some(false) || ycc_encoded(doc, s).is_some()),
     )
 }
 
-/// Whether `decode` is the default decode array for `n` components ([0 1] each), which changes
+/// Whether `decode` is the default decode array for `n` components ([0 hi_expected] each), which changes
 /// nothing. Scanners write it on page images (#490).
-fn is_identity_decode(doc: &Document, decode: &Object, n: usize) -> bool {
+fn is_identity_decode(doc: &Document, decode: &Object, n: usize, hi_expected: f64) -> bool {
     let decode = doc.resolve(decode);
     let Some(a) = decode.as_array() else { return false };
-    a.len() == 2 * n && a.chunks(2).all(|p| matches!(p, [lo, hi] if doc.resolve(lo).as_f64() == Some(0.0) && matches!(doc.resolve(hi).as_f64(), Some(1.0 | 255.0))))
+    a.len() == 2 * n
+        && a.chunks(2).all(|p| {
+            matches!(
+                p,
+                [lo, hi]
+                    if doc.resolve(lo).as_f64() == Some(0.0)
+                        && doc.resolve(hi).as_f64() == Some(hi_expected)
+            )
+        })
 }
 
 /// A new image stream from 8-bit samples: the original dictionary with the new size and filter.
@@ -674,7 +682,13 @@ fn process(doc: &Document, s: &Stream, ppi: f64, settings: &ImageSettings, desc:
     let n = desc.n;
     let palette = matches!(desc.kind, Kind::Indexed { .. });
     let jpx = matches!(desc.kind, Kind::Jpx);
-    let bad_decode = if palette { d.get(b"Decode").is_some_and(|a| !is_identity_decode(doc, a, 1)) } else { d.get(b"Decode").is_some_and(|a| !is_identity_decode(doc, a, n)) };
+    let bad_decode = match &desc.kind {
+        Kind::Indexed { bpc, .. } => {
+            let max = ((1u32 << bpc) - 1) as f64;
+            d.get(b"Decode").is_some_and(|a| !is_identity_decode(doc, a, 1, max))
+        }
+        _ => d.get(b"Decode").is_some_and(|a| !is_identity_decode(doc, a, n, 1.0)),
+    };
     if bad_decode
         || d.contains(b"Mask")
         || d.name(b"ImageMask").is_some()

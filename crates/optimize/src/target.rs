@@ -91,7 +91,8 @@ pub fn optimize_to_target(doc: &Document, base: &Settings, target_bytes: u64, pr
         }
         let settings = rung(base, LADDER[i]);
         let mut copy = doc.clone();
-        let report = optimize_with_progress(&mut copy, &settings, progress)?;
+        let mut trial_progress = |_| progress(Stage::Trial { n: trials.len() + 1, of });
+        let report = optimize_with_progress(&mut copy, &settings, &mut trial_progress)?;
         let opts = SaveOptions { object_streams: settings.effective_object_streams(), ..SaveOptions::default() };
         let bytes = write_full(&copy, &opts)?.len();
         trials.push(Trial { max_dimension: LADDER[i].0, quality: LADDER[i].1, bytes });
