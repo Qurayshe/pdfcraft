@@ -19,8 +19,12 @@ pub enum OptimizeStage {
     Discarding,
     /// Merging the fragments of a page picture into one image.
     Fragments,
+    /// Flattening tiled presentation slide image grids.
+    Flattening { done: usize, total: usize },
     /// About to process image `done` (0-based) of `total`.
     Images { done: usize, total: usize },
+    /// Running search trials to meet a target file size.
+    Trial { step: usize, total: usize },
     /// Discarding objects and compressing unencoded streams.
     CleaningUp,
     /// Merging identical fonts and images.
@@ -35,11 +39,13 @@ impl OptimizeStage {
     pub fn fraction(self) -> f32 {
         match self {
             OptimizeStage::Discarding => 0.0,
-            OptimizeStage::Fragments => 0.03,
-            OptimizeStage::Images { done, total } => 0.05 + 0.75 * if total == 0 { 1.0 } else { done.min(total) as f32 / total as f32 },
-            OptimizeStage::CleaningUp => 0.8,
-            OptimizeStage::Merging => 0.85,
-            OptimizeStage::Writing => 0.9,
+            OptimizeStage::Fragments => 0.02,
+            OptimizeStage::Flattening { done, total } => 0.02 + 0.06 * if total == 0 { 1.0 } else { done.min(total) as f32 / total as f32 },
+            OptimizeStage::Images { done, total } => 0.08 + 0.72 * if total == 0 { 1.0 } else { done.min(total) as f32 / total as f32 },
+            OptimizeStage::Trial { step, total } => 0.80 + 0.05 * if total == 0 { 1.0 } else { step.min(total) as f32 / total as f32 },
+            OptimizeStage::CleaningUp => 0.85,
+            OptimizeStage::Merging => 0.90,
+            OptimizeStage::Writing => 0.95,
         }
     }
 }
@@ -96,7 +102,9 @@ impl OptimizeJob {
         let report = optimize::optimize_with_progress(&mut cos, &settings, &mut |s| {
             step(match s {
                 optimize::Stage::Fragments => OptimizeStage::Fragments,
+                optimize::Stage::Flatten { done, total } => OptimizeStage::Flattening { done, total },
                 optimize::Stage::Images { done, total } => OptimizeStage::Images { done, total },
+                optimize::Stage::Trial { n, of } => OptimizeStage::Trial { step: n, total: of },
                 optimize::Stage::CleanUp => OptimizeStage::CleaningUp,
             })
             .is_ok()
