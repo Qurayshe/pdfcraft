@@ -647,16 +647,19 @@ fn samples(doc: &Document, s: &Stream, desc: &Desc) -> Option<Vec<u8>> {
             if data.len() < row.checked_mul(h)? {
                 return None;
             }
-            let mut out = Vec::with_capacity(w.checked_mul(h)?.checked_mul(n)?);
+            let mut out = Vec::new();
+            out.try_reserve_exact(w.checked_mul(h)?.checked_mul(n)?).ok()?;
             let per_byte = 8 / bpc;
             let mask = (1usize << bpc) - 1;
             for y in 0..h {
-                let line = data.get(y * row..(y + 1) * row)?;
+                let start = y.checked_mul(row)?;
+                let line = data.get(start..start.checked_add(row)?)?;
                 for x in 0..w {
                     let byte = usize::from(*line.get(x / per_byte)?);
                     let shift = 8 - bpc * (x % per_byte + 1);
                     let idx = ((byte >> shift) & mask).min(*hival);
-                    out.extend_from_slice(palette.get(idx * n..idx * n + n)?);
+                    let p_start = idx.checked_mul(n)?;
+                    out.extend_from_slice(palette.get(p_start..p_start.checked_add(n)?)?);
                 }
             }
             Some(out)

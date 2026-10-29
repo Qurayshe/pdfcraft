@@ -28,6 +28,7 @@
 //! - would not get smaller (the picture is not smaller than the images it replaces);
 //! - is in an encrypted document (the renderer is given the document as written).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use pdfcraft_content::{Op, parse, serialize_ops};
@@ -40,6 +41,12 @@ use crate::{FlattenSettings, OptimizeError, Report, Stage};
 
 /// Most tiles whose neighbours are counted when describing a page (the count is quadratic).
 const MAX_TOUCH_TILES: usize = 600;
+
+/// Largest longest-side dimension a flattened slide picture requests from the renderer.
+const MAX_FLATTEN_DIMENSION: u32 = 8192;
+
+/// Deepest nested Type 3 font or form XObject chain followed when checking glyph resources.
+const MAX_TYPE3_DEPTH: usize = 12;
 
 /// Why a tiled page is left as it is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,9 +111,9 @@ pub struct TiledPage {
 struct Scanned {
     info: TiledPage,
     page: Page,
-    /// The page's operators, when it can be flattened.
-    ops: Result<Vec<Op>, Skip>,
-    /// Encoded bytes of the distinct images the page draws.
+    /// The page's operators and any page XObjects its Type 3 glyphs require, when flattenable.
+    ops: Result<(Vec<Op>, Dict), Skip>,
+    /// Encoded bytes of the distinct images the page draws (excluding any kept for Type 3 glyphs).
     image_bytes: usize,
 }
 
@@ -124,8 +131,150 @@ fn has_markup_annots(doc: &Document, page: &Page) -> bool {
     })
 }
 
-/// The page's operators if it can be flattened, or why not.
-fn inspect(doc: &Document, page: &Page, draws: &PageDraws) -> Result<Vec<Op>, Skip> {
+/// Walks Type 3 fonts reachable from a page's resources so that any page `/XObject` entries
+/// referenced by Type 3 glyph procedures (when not provided by the font's or glyph's own
+/// `/Resources`) are preserved when replacing the page's `/XObject` dictionary.
+struct Type3Walk<'a> {
+    doc: &'a Document,
+    page_xobjects: Dict,
+    budget: DecodeBudget,
+    seen_fonts: HashSet<ObjRef>,
+    kept: Dict,
+    kept_refs: HashSet<ObjRef>,
+}
+
+impl<'a> Type3Walk<'a> {
+    fn dict_opt(doc: &Document, obj: Option<&Object>) -> Result<Option<Dict>, Skip> {
+        let Some(o) = obj else { return Ok(None) };
+        match &*doc.resolve(o) {
+            Object::Null => Ok(None),
+            Object::Dict(d) => Ok(Some(d.clone())),
+            _ => Err(Skip::UnreadableContent),
+        }
+    }
+
+    fn check_fonts(&mut self, fonts: &Dict, local_xobjects: &[Dict], depth: usize) -> Result<(), Skip> {
+        if depth > MAX_TYPE3_DEPTH {
+            return Err(Skip::UnreadableContent);
+        }
+        for (_, font_obj) in fonts.iter() {
+            self.check_font(font_obj, local_xobjects, depth)?;
+        }
+        Ok(())
+    }
+
+    fn check_font(&mut self, font_obj: &Object, local_xobjects: &[Dict], depth: usize) -> Result<(), Skip> {
+        let resolved = self.doc.resolve(font_obj);
+        let Some(font_dict) = resolved.as_dict() else { return Ok(()) };
+        if font_dict.name(b"Subtype") != Some(b"Type3") {
+            return Ok(());
+        }
+        if local_xobjects.is_empty() && font_obj.as_ref().is_some_and(|r| !self.seen_fonts.insert(r)) {
+            return Ok(());
+        }
+        let font_res = Self::dict_opt(self.doc, font_dict.get(b"Resources"))?;
+        let font_xobj = Self::dict_opt(self.doc, font_res.as_ref().and_then(|r| r.get(b"XObject")))?;
+        let mut font_scopes = local_xobjects.to_vec();
+        if let Some(fx) = font_xobj {
+            font_scopes.push(fx);
+        }
+        if let Some(inner_fonts) = Self::dict_opt(self.doc, font_res.as_ref().and_then(|r| r.get(b"Font")))? {
+            self.check_fonts(&inner_fonts, &font_scopes, depth + 1)?;
+        }
+        let char_procs = Self::dict_opt(self.doc, font_dict.get(b"CharProcs"))?.ok_or(Skip::UnreadableContent)?;
+        for (_, proc_obj) in char_procs.iter() {
+            let resolved_proc = self.doc.resolve(proc_obj);
+            let Object::Stream(proc_stream) = &*resolved_proc else { return Err(Skip::UnreadableContent) };
+            let proc_res = Self::dict_opt(self.doc, proc_stream.dict.get(b"Resources"))?;
+            let proc_xobj = Self::dict_opt(self.doc, proc_res.as_ref().and_then(|r| r.get(b"XObject")))?;
+            let mut proc_scopes = font_scopes.clone();
+            if let Some(px) = proc_xobj {
+                proc_scopes.push(px);
+            }
+            if let Some(inner_fonts) = Self::dict_opt(self.doc, proc_res.as_ref().and_then(|r| r.get(b"Font")))? {
+                self.check_fonts(&inner_fonts, &proc_scopes, depth + 1)?;
+            }
+            self.walk_stream(proc_stream, &proc_scopes, depth + 1)?;
+        }
+        Ok(())
+    }
+
+    fn walk_stream(&mut self, stream: &Stream, local_xobjects: &[Dict], depth: usize) -> Result<(), Skip> {
+        if depth > MAX_TYPE3_DEPTH {
+            return Err(Skip::UnreadableContent);
+        }
+        let data = self.budget.decode(stream).map_err(|_| Skip::UnreadableContent)?;
+        let parsed = parse(&data);
+        if parsed.skipped > 0 || parsed.ambiguous_images > 0 {
+            return Err(Skip::UnreadableContent);
+        }
+        for op in &parsed.ops {
+            if op.is("Do") {
+                let name = op.name(0).ok_or(Skip::UnreadableContent)?;
+                self.walk_do(name, local_xobjects, depth)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn walk_do(&mut self, name: &[u8], local_xobjects: &[Dict], depth: usize) -> Result<(), Skip> {
+        let local_hit = local_xobjects.iter().rev().find_map(|d| d.get(name)).cloned();
+        let entry = if let Some(e) = local_hit {
+            Some(e)
+        } else if let Some(e) = self.page_xobjects.get(name).cloned() {
+            if let Some(r) = e.as_ref() {
+                self.kept_refs.insert(r);
+            }
+            self.kept.set(name.to_vec(), e.clone());
+            Some(e)
+        } else {
+            None
+        };
+        let Some(entry) = entry else { return Ok(()) };
+        let resolved_x = self.doc.resolve(&entry);
+        let Object::Stream(s) = &*resolved_x else { return Ok(()) };
+        if s.dict.name(b"Subtype") != Some(b"Form") {
+            return Ok(());
+        }
+        if !self.budget.enter_form() {
+            return Err(Skip::UnreadableContent);
+        }
+        let form_res = Self::dict_opt(self.doc, s.dict.get(b"Resources"))?;
+        let form_xobj = Self::dict_opt(self.doc, form_res.as_ref().and_then(|r| r.get(b"XObject")))?;
+        let mut form_scopes = local_xobjects.to_vec();
+        if let Some(fx) = form_xobj {
+            form_scopes.push(fx);
+        }
+        if let Some(inner_fonts) = Self::dict_opt(self.doc, form_res.as_ref().and_then(|r| r.get(b"Font")))? {
+            self.check_fonts(&inner_fonts, &form_scopes, depth + 1)?;
+        }
+        self.walk_stream(s, &form_scopes, depth + 1)
+    }
+}
+
+/// Page `/XObject` entries (and their `ObjRef`s) that retained Type 3 glyph procedures resolve
+/// through the page's resources.
+fn type3_page_xobjects(doc: &Document, page: ObjRef) -> Result<(Dict, HashSet<ObjRef>), Skip> {
+    let Some(res) = crate::images::page_resources(doc, page) else { return Ok((Dict::new(), HashSet::new())) };
+    let Some(page_xobjects) = Type3Walk::dict_opt(doc, res.get(b"XObject"))? else { return Ok((Dict::new(), HashSet::new())) };
+    if page_xobjects.is_empty() {
+        return Ok((Dict::new(), HashSet::new()));
+    }
+    let Some(fonts) = Type3Walk::dict_opt(doc, res.get(b"Font"))? else { return Ok((Dict::new(), HashSet::new())) };
+    let mut walk = Type3Walk {
+        doc,
+        page_xobjects,
+        budget: DecodeBudget::page(),
+        seen_fonts: HashSet::new(),
+        kept: Dict::new(),
+        kept_refs: HashSet::new(),
+    };
+    walk.check_fonts(&fonts, &[], 0)?;
+    Ok((walk.kept, walk.kept_refs))
+}
+
+/// The page's operators and preserved Type 3 XObjects if it can be flattened, or why not.
+fn inspect(doc: &Document, page: &Page, draws: &PageDraws) -> Result<(Vec<Op>, Dict, HashSet<ObjRef>), Skip> {
     if page.rotation(doc) != 0 {
         return Err(Skip::Rotated);
     }
@@ -147,7 +296,8 @@ fn inspect(doc: &Document, page: &Page, draws: &PageDraws) -> Result<Vec<Op>, Sk
     if parsed.skipped > 0 || parsed.ambiguous_images > 0 {
         return Err(Skip::UnreadableContent);
     }
-    Ok(parsed.ops)
+    let (kept_xobjects, kept_refs) = type3_page_xobjects(doc, page.obj)?;
+    Ok((parsed.ops, kept_xobjects, kept_refs))
 }
 
 /// Every page that draws at least `min_images` images, most of them small, with how it is made
@@ -161,38 +311,40 @@ fn scan(doc: &Document, min_images: usize) -> Vec<Scanned> {
         }
         let crop = page.crop(doc);
         let page_area = area(&crop);
-        if page_area <= 0.0 {
+        if !page_area.is_finite() || page_area <= 0.0 {
             continue;
         }
         let tiles: Vec<&[f64; 4]> = draws.draws.iter().map(|d| &d.rect).filter(|r| area(r) < 0.25 * page_area).collect();
-        if tiles.len() * 2 < draws.draws.len() {
+        if tiles.len().saturating_mul(2) < draws.draws.len() {
             continue;
         }
         let tol = 0.002 * (crop[2] - crop[0]).max(crop[3] - crop[1]);
-        let mut touching = 0;
+        let mut touching = 0usize;
         if tiles.len() <= MAX_TOUCH_TILES {
             for (i, a) in tiles.iter().enumerate() {
-                for b in &tiles[i + 1..] {
+                for b in tiles.get(i + 1..).unwrap_or_default() {
                     let overlap_y = a[3].min(b[3]) - a[1].max(b[1]);
                     let overlap_x = a[2].min(b[2]) - a[0].max(b[0]);
                     let side = ((a[2] - b[0]).abs() <= tol || (b[2] - a[0]).abs() <= tol) && overlap_y > tol;
                     let stacked = ((a[3] - b[1]).abs() <= tol || (b[3] - a[1]).abs() <= tol) && overlap_x > tol;
-                    touching += usize::from(side || stacked);
+                    touching = touching.saturating_add(usize::from(side || stacked));
                 }
             }
         }
-        let coverage = draws.draws.iter().map(|d| area(&d.rect)).sum::<f64>() / page_area;
-        let mut seen = std::collections::HashSet::new();
+        let coverage = draws.draws.iter().map(|d| area(&d.rect)).filter(|a| a.is_finite()).sum::<f64>() / page_area;
+        let inspected = inspect(doc, &page, &draws);
+        let kept_refs = inspected.as_ref().map(|(_, _, r)| r);
+        let mut seen = HashSet::new();
         let image_bytes = draws
             .draws
             .iter()
-            .filter(|d| seen.insert(d.image))
+            .filter(|d| !kept_refs.is_some_and(|k| k.contains(&d.image)) && seen.insert(d.image))
             .map(|d| match &*doc.get(d.image) {
                 Object::Stream(s) => s.raw.len(),
                 _ => 0,
             })
-            .sum();
-        let ops = inspect(doc, &page, &draws);
+            .fold(0usize, usize::saturating_add);
+        let ops = inspected.map(|(ops, kept, _)| (ops, kept));
         let info = TiledPage {
             index,
             page: page.obj,
@@ -270,6 +422,7 @@ struct Plan {
     crop: [f64; 4],
     original: Option<Object>,
     text: Vec<Op>,
+    kept_xobjects: Dict,
     images: usize,
     image_bytes: usize,
 }
@@ -284,21 +437,23 @@ fn restore(doc: &mut Document, plans: &[Plan]) -> Result<(), OptimizeError> {
 }
 
 /// A name for the picture that the page's image resources don't use yet.
-fn fresh_name(doc: &Document, page: &Page) -> Vec<u8> {
-    let xobjects = page.dict.get(b"Resources").map(|r| doc.resolve(r)).and_then(|r| r.as_dict().cloned()).and_then(|r| r.get(b"XObject").map(|x| doc.resolve(x)).and_then(|x| x.as_dict().cloned()));
+fn fresh_name(doc: &Document, page: ObjRef) -> Vec<u8> {
+    let res = crate::images::page_resources(doc, page);
+    let xobjects = res.and_then(|r| r.get(b"XObject").map(|x| doc.resolve(x)).and_then(|x| x.as_dict().cloned()));
     let mut k = 0usize;
     loop {
         let name = if k == 0 { b"PCFlat".to_vec() } else { format!("PCFlat{k}").into_bytes() };
         if !xobjects.as_ref().is_some_and(|x| x.contains(&name)) {
             return name;
         }
-        k += 1;
+        k = k.saturating_add(1);
     }
 }
 
-/// Replace the page's XObjects with only the flattened picture, detaching the hundreds of tiles.
-fn set_only_xobject(doc: &mut Document, page: ObjRef, name: &[u8], image: ObjRef) -> Result<(), OptimizeError> {
-    let mut x = Dict::new();
+/// Replace the page's XObjects with the flattened picture (retaining any `keep` entries required
+/// by Type 3 glyph procedures), detaching the hundreds of tiles.
+fn set_only_xobject(doc: &mut Document, page: ObjRef, name: &[u8], image: ObjRef, keep: &Dict) -> Result<(), OptimizeError> {
+    let mut x = keep.clone();
     x.set(name.to_vec(), Object::Ref(image));
     let x_ref = doc.add(Object::Dict(x));
     let res = doc.get(page).as_dict().and_then(|d| d.get(b"Resources").cloned());
@@ -323,13 +478,56 @@ fn set_only_xobject(doc: &mut Document, page: ObjRef, name: &[u8], image: ObjRef
 }
 
 /// Premultiplied RGBA8 as RGB8 over white.
-fn rgb_over_white(rgba: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(rgba.len() / 4 * 3);
+fn rgb_over_white(rgba: &[u8]) -> Option<Vec<u8>> {
+    let cap = (rgba.len() / 4).checked_mul(3)?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(cap).ok()?;
     for px in rgba.chunks_exact(4) {
-        let hole = 255 - px[3];
-        out.extend_from_slice(&[px[0].saturating_add(hole), px[1].saturating_add(hole), px[2].saturating_add(hole)]);
+        let [r, g, b, a] = px else { continue };
+        let hole = 255 - *a;
+        out.extend_from_slice(&[r.saturating_add(hole), g.saturating_add(hole), b.saturating_add(hole)]);
     }
-    out
+    Some(out)
+}
+
+fn finish_plan(doc: &mut Document, renderer: &mut PageRenderer, plan: &Plan, settings: &FlattenSettings) -> Result<bool, OptimizeError> {
+    let (w, h) = (plan.crop[2] - plan.crop[0], plan.crop[3] - plan.crop[1]);
+    if !w.is_finite() || !h.is_finite() || w <= 0.0 || h <= 0.0 {
+        return Ok(false);
+    }
+    let max_dim = settings.max_dimension.clamp(16, MAX_FLATTEN_DIMENSION);
+    let scale = effective_scale(w as f32, h as f32, max_dim as f32 / w.max(h) as f32);
+    let page = renderer.render(RenderRequest { page: plan.index, scale, ..RenderRequest::default() });
+    let pixels = (page.width as usize).checked_mul(page.height as usize);
+    if page.error.is_some() || page.width == 0 || page.height == 0 || pixels.and_then(|n| n.checked_mul(4)) != Some(page.rgba.len()) {
+        return Ok(false);
+    }
+    let Some(rgb) = rgb_over_white(&page.rgba) else { return Ok(false) };
+    let Some(data) = jpeg(&rgb, 3, page.width, page.height, settings.quality) else { return Ok(false) };
+    if data.len() >= plan.image_bytes {
+        return Ok(false);
+    }
+    let mut dict = Dict::new();
+    dict.set(b"Type".to_vec(), Object::name("XObject"));
+    dict.set(b"Subtype".to_vec(), Object::name("Image"));
+    dict.set(b"Width".to_vec(), Object::Int(i64::from(page.width)));
+    dict.set(b"Height".to_vec(), Object::Int(i64::from(page.height)));
+    dict.set(b"ColorSpace".to_vec(), Object::name("DeviceRGB"));
+    dict.set(b"BitsPerComponent".to_vec(), Object::Int(8));
+    dict.set(b"Filter".to_vec(), Object::name("DCTDecode"));
+    let image = doc.add(Object::Stream(Stream::from_raw(dict, data)));
+    let name = fresh_name(doc, plan.page);
+    set_only_xobject(doc, plan.page, &name, image, &plan.kept_xobjects)?;
+    let mut ops = vec![
+        Op::new("q", Vec::new()),
+        Op::new("cm", vec![Object::Real(w), Object::Int(0), Object::Int(0), Object::Real(h), Object::Real(plan.crop[0]), Object::Real(plan.crop[1])]),
+        Op::new("Do", vec![Object::Name(name)]),
+        Op::new("Q", Vec::new()),
+    ];
+    ops.extend(plan.text.iter().cloned());
+    let contents = doc.add(Object::Stream(Stream::flate(Dict::new(), &serialize_ops(&ops))));
+    doc.update_dict(plan.page, |d| d.set(b"Contents".to_vec(), Object::Ref(contents)))?;
+    Ok(true)
 }
 
 pub(crate) fn run(doc: &mut Document, settings: &FlattenSettings, report: &mut Report, progress: &mut dyn FnMut(Stage) -> bool) -> Result<(), OptimizeError> {
@@ -346,7 +544,7 @@ pub(crate) fn run(doc: &mut Document, settings: &FlattenSettings, report: &mut R
     // serialization of the document lets the renderer draw every page as the picture will be.
     let mut plans = Vec::new();
     for s in scanned {
-        let Ok(ops) = s.ops else {
+        let Ok((ops, kept_xobjects)) = s.ops else {
             report.pages_not_flattened += 1;
             continue;
         };
@@ -354,7 +552,16 @@ pub(crate) fn run(doc: &mut Document, settings: &FlattenSettings, report: &mut R
         let original = doc.get(s.page.obj).as_dict().and_then(|d| d.get(b"Contents").cloned());
         let stripped = doc.add(Object::Stream(Stream::flate(Dict::new(), &serialize_ops(&background))));
         doc.update_dict(s.page.obj, |d| d.set(b"Contents".to_vec(), Object::Ref(stripped)))?;
-        plans.push(Plan { index: s.info.index, page: s.page.obj, crop: s.page.crop(doc), original, text, images: s.info.images, image_bytes: s.image_bytes });
+        plans.push(Plan {
+            index: s.info.index,
+            page: s.page.obj,
+            crop: s.page.crop(doc),
+            original,
+            text,
+            kept_xobjects,
+            images: s.info.images,
+            image_bytes: s.image_bytes,
+        });
     }
     if plans.is_empty() {
         return Ok(());
@@ -369,59 +576,18 @@ pub(crate) fn run(doc: &mut Document, settings: &FlattenSettings, report: &mut R
     let mut renderer = PageRenderer::new(Arc::new(bytes), RenderConfig { hide_comments: true, ..RenderConfig::default() });
     // Stage 2: draw each page, store the picture, put the text back.
     let total = plans.len();
-    let all_pages = pdfcraft_model::pages(doc);
     for (done, plan) in plans.iter().enumerate() {
         if !progress(Stage::Flatten { done, total }) {
-            restore(doc, &plans[done..])?;
+            restore(doc, plans.get(done..).unwrap_or_default())?;
             return Err(OptimizeError::Cancelled);
         }
-        let (w, h) = (plan.crop[2] - plan.crop[0], plan.crop[3] - plan.crop[1]);
-        let scale = effective_scale(w as f32, h as f32, settings.max_dimension.max(16) as f32 / w.max(h) as f32);
-        let page = renderer.render(RenderRequest { page: plan.index, scale, ..RenderRequest::default() });
-        let fail = |doc: &mut Document, plan: &Plan| restore(doc, std::slice::from_ref(plan));
-        if page.error.is_some() || page.width == 0 || page.height == 0 || page.rgba.len() != page.width as usize * page.height as usize * 4 {
-            fail(doc, plan)?;
+        if finish_plan(doc, &mut renderer, plan, settings)? {
+            report.pages_flattened += 1;
+            report.tiles_flattened += plan.images;
+        } else {
+            restore(doc, std::slice::from_ref(plan))?;
             report.pages_not_flattened += 1;
-            continue;
         }
-        let rgb = rgb_over_white(&page.rgba);
-        let Some(data) = jpeg(&rgb, 3, page.width, page.height, settings.quality) else {
-            fail(doc, plan)?;
-            report.pages_not_flattened += 1;
-            continue;
-        };
-        if data.len() >= plan.image_bytes {
-            fail(doc, plan)?;
-            report.pages_not_flattened += 1;
-            continue;
-        }
-        let mut dict = Dict::new();
-        dict.set(b"Type".to_vec(), Object::name("XObject"));
-        dict.set(b"Subtype".to_vec(), Object::name("Image"));
-        dict.set(b"Width".to_vec(), Object::Int(i64::from(page.width)));
-        dict.set(b"Height".to_vec(), Object::Int(i64::from(page.height)));
-        dict.set(b"ColorSpace".to_vec(), Object::name("DeviceRGB"));
-        dict.set(b"BitsPerComponent".to_vec(), Object::Int(8));
-        dict.set(b"Filter".to_vec(), Object::name("DCTDecode"));
-        let image = doc.add(Object::Stream(Stream::from_raw(dict, data)));
-        let Some(leaf) = all_pages.iter().find(|p| p.obj == plan.page) else {
-            fail(doc, plan)?;
-            report.pages_not_flattened += 1;
-            continue;
-        };
-        let name = fresh_name(doc, leaf);
-        set_only_xobject(doc, plan.page, &name, image)?;
-        let mut ops = vec![
-            Op::new("q", Vec::new()),
-            Op::new("cm", vec![Object::Real(w), Object::Int(0), Object::Int(0), Object::Real(h), Object::Real(plan.crop[0]), Object::Real(plan.crop[1])]),
-            Op::new("Do", vec![Object::Name(name)]),
-            Op::new("Q", Vec::new()),
-        ];
-        ops.extend(plan.text.iter().cloned());
-        let contents = doc.add(Object::Stream(Stream::flate(Dict::new(), &serialize_ops(&ops))));
-        doc.update_dict(plan.page, |d| d.set(b"Contents".to_vec(), Object::Ref(contents)))?;
-        report.pages_flattened += 1;
-        report.tiles_flattened += plan.images;
     }
     if !progress(Stage::Flatten { done: total, total }) {
         return Err(OptimizeError::Cancelled);
@@ -464,7 +630,7 @@ mod tests {
 
     #[test]
     fn premultiplied_pixels_go_over_white() {
-        assert_eq!(rgb_over_white(&[10, 20, 30, 255, 0, 0, 0, 0, 50, 50, 50, 128]), vec![10, 20, 30, 255, 255, 255, 177, 177, 177]);
+        assert_eq!(rgb_over_white(&[10, 20, 30, 255, 0, 0, 0, 0, 50, 50, 50, 128]), Some(vec![10, 20, 30, 255, 255, 255, 177, 177, 177]));
     }
 
     #[test]
@@ -487,7 +653,7 @@ mod tests {
         let page_ref = doc.add(Object::Dict(page_dict));
 
         let img_ref = doc.add(Object::Dict(Dict::new()));
-        set_only_xobject(&mut doc, page_ref, b"PCFlat", img_ref).unwrap();
+        set_only_xobject(&mut doc, page_ref, b"PCFlat", img_ref, &Dict::new()).unwrap();
 
         let page_obj = doc.get(page_ref);
         let res = page_obj.as_dict().unwrap().get(b"Resources").unwrap();
@@ -495,6 +661,152 @@ mod tests {
         let res_dict = resolved.as_dict().unwrap();
         assert!(res_dict.get(b"Font").is_some(), "inherited Font must survive");
         assert!(res_dict.get(b"XObject").is_some(), "XObject must be set");
+    }
+
+    fn add_rgb_image(doc: &mut Document, w: i64, h: i64, fill: u8) -> ObjRef {
+        let mut d = Dict::new();
+        d.set(b"Type".to_vec(), Object::name("XObject"));
+        d.set(b"Subtype".to_vec(), Object::name("Image"));
+        d.set(b"Width".to_vec(), Object::Int(w));
+        d.set(b"Height".to_vec(), Object::Int(h));
+        d.set(b"ColorSpace".to_vec(), Object::name("DeviceRGB"));
+        d.set(b"BitsPerComponent".to_vec(), Object::Int(8));
+        doc.add(Object::Stream(Stream::from_raw(d, vec![fill; (w * h * 3) as usize])))
+    }
+
+    #[test]
+    fn type3_glyph_xobjects_resolved_through_page_are_preserved() {
+        let mut doc = Document::new_empty();
+        let mut xobjects = Dict::new();
+        let mut content_ops = String::new();
+        for i in 0..8 {
+            let tile = add_rgb_image(&mut doc, 40, 40, (i * 25) as u8);
+            let name = format!("T{i}");
+            xobjects.set(name.as_bytes().to_vec(), Object::Ref(tile));
+            let x = (i % 4) * 20;
+            let y = (i / 4) * 20;
+            content_ops.push_str(&format!("q 20 0 0 20 {x} {y} cm /{name} Do Q\n"));
+        }
+        let glyph_img = add_rgb_image(&mut doc, 4, 4, 200);
+        xobjects.set(b"ImGlyph".to_vec(), Object::Ref(glyph_img));
+        content_ops.push_str("BT /T3 12 Tf 10 50 Td (A) Tj ET\n");
+
+        let glyph_proc = doc.add(Object::Stream(Stream::from_raw(Dict::new(), b"1 0 d0 q 1 0 0 1 0 0 cm /ImGlyph Do Q".to_vec())));
+        let mut char_procs = Dict::new();
+        char_procs.set(b"A".to_vec(), Object::Ref(glyph_proc));
+
+        let mut enc = Dict::new();
+        enc.set(b"Type".to_vec(), Object::name("Encoding"));
+        enc.set(b"Differences".to_vec(), Object::Array(vec![Object::Int(65), Object::name("A")]));
+
+        let mut t3 = Dict::new();
+        t3.set(b"Type".to_vec(), Object::name("Font"));
+        t3.set(b"Subtype".to_vec(), Object::name("Type3"));
+        t3.set(b"FontBBox".to_vec(), Object::Array(vec![0.into(), 0.into(), 1.into(), 1.into()]));
+        t3.set(b"FontMatrix".to_vec(), Object::Array(vec![1.into(), 0.into(), 0.into(), 1.into(), 0.into(), 0.into()]));
+        t3.set(b"CharProcs".to_vec(), Object::Dict(char_procs));
+        t3.set(b"Encoding".to_vec(), Object::Dict(enc));
+        t3.set(b"FirstChar".to_vec(), Object::Int(65));
+        t3.set(b"LastChar".to_vec(), Object::Int(65));
+        t3.set(b"Widths".to_vec(), Object::Array(vec![Object::Int(1)]));
+        let t3_ref = doc.add(Object::Dict(t3));
+
+        let mut fonts = Dict::new();
+        fonts.set(b"T3".to_vec(), Object::Ref(t3_ref));
+
+        let mut res = Dict::new();
+        res.set(b"XObject".to_vec(), Object::Dict(xobjects));
+        res.set(b"Font".to_vec(), Object::Dict(fonts));
+
+        let contents_ref = doc.add(Object::Stream(Stream::from_raw(Dict::new(), content_ops.into_bytes())));
+        let pages_ref = doc.add(Object::Dict(Dict::new()));
+
+        let mut page_dict = Dict::new();
+        page_dict.set(b"Type".to_vec(), Object::name("Page"));
+        page_dict.set(b"Parent".to_vec(), Object::Ref(pages_ref));
+        page_dict.set(b"MediaBox".to_vec(), Object::Array(vec![0.into(), 0.into(), 200.into(), 200.into()]));
+        page_dict.set(b"Resources".to_vec(), Object::Dict(res));
+        page_dict.set(b"Contents".to_vec(), Object::Ref(contents_ref));
+        let page_ref = doc.add(Object::Dict(page_dict));
+
+        let mut pages_dict = Dict::new();
+        pages_dict.set(b"Type".to_vec(), Object::name("Pages"));
+        pages_dict.set(b"Kids".to_vec(), Object::Array(vec![Object::Ref(page_ref)]));
+        pages_dict.set(b"Count".to_vec(), Object::Int(1));
+        doc.set(pages_ref, Object::Dict(pages_dict));
+
+        let mut cat = Dict::new();
+        cat.set(b"Type".to_vec(), Object::name("Catalog"));
+        cat.set(b"Pages".to_vec(), Object::Ref(pages_ref));
+        let cat_ref = doc.add(Object::Dict(cat));
+        doc.trailer_mut().set(b"Root".to_vec(), Object::Ref(cat_ref));
+
+        let mut report = Report::default();
+        run(&mut doc, &FlattenSettings { enabled: true, min_images: 8, max_dimension: 200, quality: 70 }, &mut report, &mut |_| true).unwrap();
+        assert_eq!(report.pages_flattened, 1);
+
+        let page_obj = doc.get(page_ref);
+        let res_obj = doc.resolve(page_obj.as_dict().unwrap().get(b"Resources").unwrap());
+        let xobj_obj = doc.resolve(res_obj.as_dict().unwrap().get(b"XObject").unwrap());
+        let xobj_dict = xobj_obj.as_dict().unwrap();
+        assert!(xobj_dict.contains(b"PCFlat"), "flattened picture must be installed");
+        assert_eq!(xobj_dict.reference(b"ImGlyph"), Some(glyph_img), "Type 3 glyph XObject resolved through page must survive");
+        assert!(!xobj_dict.contains(b"T0"), "tile XObjects must be detached");
+    }
+
+    #[test]
+    fn type3_glyph_with_unreadable_stream_skips_flattening() {
+        let mut doc = Document::new_empty();
+        let mut xobjects = Dict::new();
+        let mut content_ops = String::new();
+        for i in 0..8 {
+            let tile = add_rgb_image(&mut doc, 40, 40, (i * 25) as u8);
+            let name = format!("T{i}");
+            xobjects.set(name.as_bytes().to_vec(), Object::Ref(tile));
+            content_ops.push_str(&format!("q 10 0 0 10 0 0 cm /{name} Do Q\n"));
+        }
+        let mut bad_dict = Dict::new();
+        bad_dict.set(b"Filter".to_vec(), Object::name("NoSuchFilter"));
+        let bad_proc = doc.add(Object::Stream(Stream::from_raw(bad_dict, b"/ImGlyph Do".to_vec())));
+        let mut char_procs = Dict::new();
+        char_procs.set(b"A".to_vec(), Object::Ref(bad_proc));
+
+        let mut t3 = Dict::new();
+        t3.set(b"Type".to_vec(), Object::name("Font"));
+        t3.set(b"Subtype".to_vec(), Object::name("Type3"));
+        t3.set(b"CharProcs".to_vec(), Object::Dict(char_procs));
+        let mut fonts = Dict::new();
+        fonts.set(b"T3".to_vec(), Object::Dict(t3));
+
+        let mut res = Dict::new();
+        res.set(b"XObject".to_vec(), Object::Dict(xobjects));
+        res.set(b"Font".to_vec(), Object::Dict(fonts));
+
+        let contents_ref = doc.add(Object::Stream(Stream::from_raw(Dict::new(), content_ops.into_bytes())));
+        let pages_ref = doc.add(Object::Dict(Dict::new()));
+        let mut page_dict = Dict::new();
+        page_dict.set(b"Type".to_vec(), Object::name("Page"));
+        page_dict.set(b"Parent".to_vec(), Object::Ref(pages_ref));
+        page_dict.set(b"MediaBox".to_vec(), Object::Array(vec![0.into(), 0.into(), 200.into(), 200.into()]));
+        page_dict.set(b"Resources".to_vec(), Object::Dict(res));
+        page_dict.set(b"Contents".to_vec(), Object::Ref(contents_ref));
+        let page_ref = doc.add(Object::Dict(page_dict));
+
+        let mut pages_dict = Dict::new();
+        pages_dict.set(b"Type".to_vec(), Object::name("Pages"));
+        pages_dict.set(b"Kids".to_vec(), Object::Array(vec![Object::Ref(page_ref)]));
+        pages_dict.set(b"Count".to_vec(), Object::Int(1));
+        doc.set(pages_ref, Object::Dict(pages_dict));
+
+        let mut cat = Dict::new();
+        cat.set(b"Type".to_vec(), Object::name("Catalog"));
+        cat.set(b"Pages".to_vec(), Object::Ref(pages_ref));
+        let cat_ref = doc.add(Object::Dict(cat));
+        doc.trailer_mut().set(b"Root".to_vec(), Object::Ref(cat_ref));
+
+        let detected = detect_tiled_pages(&doc, 8);
+        assert_eq!(detected.len(), 1);
+        assert_eq!(detected[0].skip, Some(Skip::UnreadableContent));
     }
 }
 

@@ -86,16 +86,17 @@ pub fn optimize_to_target(doc: &Document, base: &Settings, target_bytes: u64, pr
     let of = LADDER.len();
     let mut trials = Vec::new();
     let mut try_rung = |i: usize, trials: &mut Vec<Trial>| -> Result<(Document, Settings, Report, usize), OptimizeError> {
+        let &(max_dimension, quality) = LADDER.get(i).ok_or(OptimizeError::NoPages)?;
         if !progress(Stage::Trial { n: trials.len() + 1, of }) {
             return Err(OptimizeError::Cancelled);
         }
-        let settings = rung(base, LADDER[i]);
+        let settings = rung(base, (max_dimension, quality));
         let mut copy = doc.clone();
         let mut trial_progress = |_| progress(Stage::Trial { n: trials.len() + 1, of });
         let report = optimize_with_progress(&mut copy, &settings, &mut trial_progress)?;
         let opts = SaveOptions { object_streams: settings.effective_object_streams(), ..SaveOptions::default() };
         let bytes = write_full(&copy, &opts)?.len();
-        trials.push(Trial { max_dimension: LADDER[i].0, quality: LADDER[i].1, bytes });
+        trials.push(Trial { max_dimension, quality, bytes });
         Ok((copy, settings, report, bytes))
     };
     // The first rung that fits, assuming each rung is no larger than the one before.

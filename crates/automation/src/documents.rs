@@ -289,10 +289,11 @@ impl Automation {
         };
         if let Some(v) = a.get("target_mb") {
             let mb = v.as_f64().ok_or_else(|| ToolError::InvalidArgs("target_mb must be a number".into()))?;
-            if mb <= 0.0 {
-                return Err(ToolError::InvalidArgs(format!("target_mb must be positive, got {mb}")));
+            let mb_f32 = mb as f32;
+            if !mb.is_finite() || mb <= 0.0 || !mb_f32.is_finite() || mb_f32 <= 0.0 {
+                return Err(ToolError::InvalidArgs(format!("target_mb must be a positive finite number, got {mb}")));
             }
-            settings.target_mb = Some(mb as f32);
+            settings.target_mb = Some(mb_f32);
         }
         if let Some(c) = a.opt_str("compatibility")? {
             settings.compatibility = Compatibility::from_name(c)

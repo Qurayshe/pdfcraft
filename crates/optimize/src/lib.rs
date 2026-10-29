@@ -4,13 +4,22 @@
 //! - **Merge image fragments:** a page picture some PDF printers draw as thousands of images one
 //!   pixel row high is put back together into one image first (see [`fragments`]), so the image
 //!   settings can work on it.
+//! - **Flatten tiled slides:** when [`Settings::flatten_tiles`] is enabled (as in
+//!   [`Preset::Presentation`]), pages composed of many small image tiles are rendered without
+//!   their text into a single background JPEG while keeping selectable vector text on top (see
+//!   [`flatten`]).
 //! - **Images:** each image's effective resolution is measured where pages draw it (the
 //!   smallest over its uses, through form XObjects); colour and grayscale images above a
-//!   threshold are resampled (bicubic) to a target resolution and recompressed as JPEG or Flate.
-//!   A new image replaces the old one only if it is smaller. Images PdfCraft can't decode
-//!   faithfully (CMYK and other colour spaces, masks, decode arrays other than the default,
-//!   JPEG 2000, JBIG2, CCITT, other than 8 bits, JPEGs whose Adobe marker and `/ColorTransform`
-//!   disagree) are left alone.
+//!   threshold (or exceeding [`Settings::max_image_dimension`]) are resampled (bicubic) and
+//!   recompressed as JPEG or Flate. When [`Settings::extended_formats`] is enabled, JPEG 2000
+//!   (`JPXDecode`) and palette (`/Indexed`) images are also decoded and recompressed. A new image
+//!   replaces the old one only if it is smaller. Images PdfCraft can't decode faithfully (CMYK
+//!   and other colour spaces, masks, decode arrays other than the default, JBIG2, CCITT, other
+//!   than 8 bits for non-palette images, JPEGs whose Adobe marker and `/ColorTransform` disagree)
+//!   are left alone.
+//! - **Target file size:** when [`Settings::target_mb`] is set, [`optimize_to_target`] searches
+//!   [`LADDER`] by bisection to find the sharpest dimension and JPEG quality settings that fit
+//!   within the requested byte budget.
 //! - **Discard objects:** page thumbnails, alternate images, document tags (structure tree),
 //!   print settings.
 //! - **Clean up:** drop images and forms that pages list but never draw (such as a deleted
@@ -358,8 +367,8 @@ pub fn optimize(doc: &mut Document, settings: &Settings) -> Result<Report, Optim
 /// during a long one). Returning `false` stops with [`OptimizeError::Cancelled`]; `doc` is then
 /// partly optimized and should be dropped.
 pub fn optimize_with_progress(doc: &mut Document, settings: &Settings, progress: &mut dyn FnMut(Stage) -> bool) -> Result<Report, OptimizeError> {
-    if let Some(target_mb) = settings.target_mb {
-        let target_bytes = (target_mb as f64 * 1024.0 * 1024.0).round() as u64;
+    if let Some(target_mb) = settings.target_mb.filter(|m| m.is_finite() && *m > 0.0) {
+        let target_bytes = (f64::from(target_mb) * 1024.0 * 1024.0).round().clamp(1.0, u64::MAX as f64) as u64;
         let mut base = settings.clone();
         base.target_mb = None;
         let outcome = target::optimize_to_target(doc, &base, target_bytes, progress)?;
