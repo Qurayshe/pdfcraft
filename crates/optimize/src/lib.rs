@@ -156,7 +156,8 @@ impl ImageSettings {
     pub const MOBILE: ImageSettings = ImageSettings { downsample: true, target_ppi: 96.0, above_ppi: 144.0, compression: Compression::Jpeg(80) };
     /// The Presentation preset: no resolution rule (a slide's page size says nothing about how
     /// sharp it needs to be: see [`Settings::max_image_dimension`]), JPEG at quality 70.
-    pub const PRESENTATION: ImageSettings = ImageSettings { downsample: false, target_ppi: 96.0, above_ppi: 144.0, compression: Compression::Jpeg(70) };
+    pub const PRESENTATION: ImageSettings =
+        ImageSettings { downsample: false, target_ppi: 96.0, above_ppi: 144.0, compression: Compression::Jpeg(70) };
 }
 
 /// Replace pages that are made of many image tiles with one picture each.

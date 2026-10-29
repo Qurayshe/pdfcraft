@@ -82,7 +82,12 @@ fn rung(base: &Settings, (max_dimension, quality): (u32, u8)) -> Settings {
 /// The size is the optimizer's own full save (object streams as `base` says), which the caller's
 /// save of the returned document matches or, with extra clean-up such as merging identical
 /// objects, undercuts.
-pub fn optimize_to_target(doc: &Document, base: &Settings, target_bytes: u64, progress: &mut dyn FnMut(Stage) -> bool) -> Result<TargetOutcome, OptimizeError> {
+pub fn optimize_to_target(
+    doc: &Document,
+    base: &Settings,
+    target_bytes: u64,
+    progress: &mut dyn FnMut(Stage) -> bool,
+) -> Result<TargetOutcome, OptimizeError> {
     let of = LADDER.len();
     let mut trials = Vec::new();
     let mut try_rung = |i: usize, trials: &mut Vec<Trial>| -> Result<(Document, Settings, Report, usize), OptimizeError> {

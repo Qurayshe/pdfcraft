@@ -285,7 +285,9 @@ impl Automation {
         let path = self.resolve(a.str("path")?, true)?;
         let mut settings = match a.opt_str("preset")? {
             None => Preset::Standard.settings(),
-            Some(p) => Preset::from_name(p).ok_or_else(|| ToolError::InvalidArgs(format!("unknown preset {p:?} (standard, mobile, presentation)")))?.settings(),
+            Some(p) => Preset::from_name(p)
+                .ok_or_else(|| ToolError::InvalidArgs(format!("unknown preset {p:?} (standard, mobile, presentation)")))?
+                .settings(),
         };
         if let Some(v) = a.get("target_mb") {
             let mb = v.as_f64().ok_or_else(|| ToolError::InvalidArgs("target_mb must be a number".into()))?;

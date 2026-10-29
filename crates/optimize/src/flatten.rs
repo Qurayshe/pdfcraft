@@ -48,6 +48,9 @@ const MAX_FLATTEN_DIMENSION: u32 = 8192;
 /// Deepest nested Type 3 font or form XObject chain followed when checking glyph resources.
 const MAX_TYPE3_DEPTH: usize = 12;
 
+/// Most font and form steps evaluated while walking Type 3 glyph resources (bounds traversal).
+const MAX_TYPE3_STEPS: usize = 10_000;
+
 /// Why a tiled page is left as it is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Skip {
@@ -141,9 +144,18 @@ struct Type3Walk<'a> {
     seen_fonts: HashSet<ObjRef>,
     kept: Dict,
     kept_refs: HashSet<ObjRef>,
+    steps: usize,
 }
 
 impl<'a> Type3Walk<'a> {
+    fn step(&mut self) -> Result<(), Skip> {
+        self.steps = self.steps.saturating_add(1);
+        if self.steps > MAX_TYPE3_STEPS {
+            return Err(Skip::UnreadableContent);
+        }
+        Ok(())
+    }
+
     fn dict_opt(doc: &Document, obj: Option<&Object>) -> Result<Option<Dict>, Skip> {
         let Some(o) = obj else { return Ok(None) };
         match &*doc.resolve(o) {
@@ -164,6 +176,7 @@ impl<'a> Type3Walk<'a> {
     }
 
     fn check_font(&mut self, font_obj: &Object, local_xobjects: &[Dict], depth: usize) -> Result<(), Skip> {
+        self.step()?;
         let resolved = self.doc.resolve(font_obj);
         let Some(font_dict) = resolved.as_dict() else { return Ok(()) };
         if font_dict.name(b"Subtype") != Some(b"Type3") {
@@ -218,6 +231,7 @@ impl<'a> Type3Walk<'a> {
     }
 
     fn walk_do(&mut self, name: &[u8], local_xobjects: &[Dict], depth: usize) -> Result<(), Skip> {
+        self.step()?;
         let local_hit = local_xobjects.iter().rev().find_map(|d| d.get(name)).cloned();
         let entry = if let Some(e) = local_hit {
             Some(e)
@@ -268,6 +282,7 @@ fn type3_page_xobjects(doc: &Document, page: ObjRef) -> Result<(Dict, HashSet<Ob
         seen_fonts: HashSet::new(),
         kept: Dict::new(),
         kept_refs: HashSet::new(),
+        steps: 0,
     };
     walk.check_fonts(&fonts, &[], 0)?;
     Ok((walk.kept, walk.kept_refs))
@@ -530,7 +545,12 @@ fn finish_plan(doc: &mut Document, renderer: &mut PageRenderer, plan: &Plan, set
     Ok(true)
 }
 
-pub(crate) fn run(doc: &mut Document, settings: &FlattenSettings, report: &mut Report, progress: &mut dyn FnMut(Stage) -> bool) -> Result<(), OptimizeError> {
+pub(crate) fn run(
+    doc: &mut Document,
+    settings: &FlattenSettings,
+    report: &mut Report,
+    progress: &mut dyn FnMut(Stage) -> bool,
+) -> Result<(), OptimizeError> {
     let scanned = scan(doc, settings.min_images);
     report.tiled_pages += scanned.len();
     if scanned.is_empty() {
@@ -770,6 +790,63 @@ mod tests {
         let bad_proc = doc.add(Object::Stream(Stream::from_raw(bad_dict, b"/ImGlyph Do".to_vec())));
         let mut char_procs = Dict::new();
         char_procs.set(b"A".to_vec(), Object::Ref(bad_proc));
+
+        let mut t3 = Dict::new();
+        t3.set(b"Type".to_vec(), Object::name("Font"));
+        t3.set(b"Subtype".to_vec(), Object::name("Type3"));
+        t3.set(b"CharProcs".to_vec(), Object::Dict(char_procs));
+        let mut fonts = Dict::new();
+        fonts.set(b"T3".to_vec(), Object::Dict(t3));
+
+        let mut res = Dict::new();
+        res.set(b"XObject".to_vec(), Object::Dict(xobjects));
+        res.set(b"Font".to_vec(), Object::Dict(fonts));
+
+        let contents_ref = doc.add(Object::Stream(Stream::from_raw(Dict::new(), content_ops.into_bytes())));
+        let pages_ref = doc.add(Object::Dict(Dict::new()));
+        let mut page_dict = Dict::new();
+        page_dict.set(b"Type".to_vec(), Object::name("Page"));
+        page_dict.set(b"Parent".to_vec(), Object::Ref(pages_ref));
+        page_dict.set(b"MediaBox".to_vec(), Object::Array(vec![0.into(), 0.into(), 200.into(), 200.into()]));
+        page_dict.set(b"Resources".to_vec(), Object::Dict(res));
+        page_dict.set(b"Contents".to_vec(), Object::Ref(contents_ref));
+        let page_ref = doc.add(Object::Dict(page_dict));
+
+        let mut pages_dict = Dict::new();
+        pages_dict.set(b"Type".to_vec(), Object::name("Pages"));
+        pages_dict.set(b"Kids".to_vec(), Object::Array(vec![Object::Ref(page_ref)]));
+        pages_dict.set(b"Count".to_vec(), Object::Int(1));
+        doc.set(pages_ref, Object::Dict(pages_dict));
+
+        let mut cat = Dict::new();
+        cat.set(b"Type".to_vec(), Object::name("Catalog"));
+        cat.set(b"Pages".to_vec(), Object::Ref(pages_ref));
+        let cat_ref = doc.add(Object::Dict(cat));
+        doc.trailer_mut().set(b"Root".to_vec(), Object::Ref(cat_ref));
+
+        let detected = detect_tiled_pages(&doc, 8);
+        assert_eq!(detected.len(), 1);
+        assert_eq!(detected[0].skip, Some(Skip::UnreadableContent));
+    }
+
+    #[test]
+    fn type3_glyph_traversal_step_limit_aborts() {
+        let mut doc = Document::new_empty();
+        let mut xobjects = Dict::new();
+        let mut content_ops = String::new();
+        for i in 0..8 {
+            let tile = add_rgb_image(&mut doc, 40, 40, (i * 25) as u8);
+            let name = format!("T{i}");
+            xobjects.set(name.as_bytes().to_vec(), Object::Ref(tile));
+            content_ops.push_str(&format!("q 10 0 0 10 0 0 cm /{name} Do Q\n"));
+        }
+        let mut proc_ops = Vec::new();
+        for _ in 0..=MAX_TYPE3_STEPS {
+            proc_ops.extend_from_slice(b"/X Do\n");
+        }
+        let proc = doc.add(Object::Stream(Stream::from_raw(Dict::new(), proc_ops)));
+        let mut char_procs = Dict::new();
+        char_procs.set(b"A".to_vec(), Object::Ref(proc));
 
         let mut t3 = Dict::new();
         t3.set(b"Type".to_vec(), Object::name("Font"));
