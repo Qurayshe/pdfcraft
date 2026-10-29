@@ -89,7 +89,7 @@ fn stage_label(stage: OptimizeStage) -> String {
             &[("d", &(done + 1).min(total.max(1)).to_string()), ("t", &total.max(1).to_string())],
         ),
         OptimizeStage::Trial { step, total } => crate::i18n::fmt(
-            tl!("Optimizing… trial {d} of {t} to fit target size"),
+            tl!("Optimizing… trial {d} of at most {t} to fit the target size"),
             &[("d", &step.min(total.max(1)).to_string()), ("t", &total.max(1).to_string())],
         ),
         OptimizeStage::CleaningUp => tl!("Optimizing… cleaning up").to_string(),
@@ -226,14 +226,19 @@ pub(crate) fn body(ui: &mut egui::Ui, d: &mut OptimizeDraft, t: &Tokens) -> (boo
             );
             ui.add_space(6.0);
             let mut target_on = s.target_mb.is_some();
-            if ui.add(widgets::checkbox(&mut target_on, tl!("Target file size budget (MB)"))).changed() {
+            if ui.add(widgets::checkbox(&mut target_on, tl!("Optimize to target file size budget"))).changed() {
                 s.target_mb = if target_on { Some(20.0) } else { None };
             }
             if let Some(target) = &mut s.target_mb {
                 ui.horizontal(|ui| {
-                    ui.label(tl!("Target size"));
+                    ui.label(tl!("Target file size"));
                     ui.add(egui::DragValue::new(target).range(0.5..=500.0).suffix(" MB").speed(0.5));
                 });
+                ui.label(
+                    egui::RichText::new(tl!("Searches image resolution and quality settings for the sharpest result that fits."))
+                        .small()
+                        .color(t.text_muted),
+                );
             }
         }
         OptimizeTab::Presentation => {
@@ -267,25 +272,6 @@ pub(crate) fn body(ui: &mut egui::Ui, d: &mut OptimizeDraft, t: &Tokens) -> (boo
                 });
             }
             ui.add(widgets::checkbox(&mut s.extended_formats, tl!("Recompress JPEG 2000 and palette images")));
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new(tl!("Target File Size Budget")).font(theme::semibold(13.0)));
-            let mut target_on = s.target_mb.is_some();
-            if ui.add(widgets::checkbox(&mut target_on, tl!("Optimize to target file size budget"))).changed() {
-                s.target_mb = if target_on { Some(20.0) } else { None };
-            }
-            if let Some(target) = &mut s.target_mb {
-                ui.horizontal(|ui| {
-                    ui.label(tl!("Target file size"));
-                    ui.add(egui::DragValue::new(target).range(0.5..=500.0).suffix(" MB").speed(0.5));
-                });
-                ui.label(
-                    egui::RichText::new(tl!("Automatically searches image resolution and quality ladder rungs to find the sharpest result that fits."))
-                        .small()
-                        .color(t.text_muted),
-                );
-            }
         }
         OptimizeTab::DiscardObjects => {
             discard_box(ui, &mut d.discard, Hidden::LinksActionsScripts, "Discard all links, actions and JavaScript");

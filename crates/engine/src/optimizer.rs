@@ -42,7 +42,9 @@ impl OptimizeStage {
             OptimizeStage::Fragments => 0.02,
             OptimizeStage::Flattening { done, total } => 0.02 + 0.06 * if total == 0 { 1.0 } else { done.min(total) as f32 / total as f32 },
             OptimizeStage::Images { done, total } => 0.08 + 0.72 * if total == 0 { 1.0 } else { done.min(total) as f32 / total as f32 },
-            OptimizeStage::Trial { step, total } => 0.80 + 0.05 * if total == 0 { 1.0 } else { step.min(total) as f32 / total as f32 },
+            // A target search runs the whole optimization per rung, so it is the bulk of the work,
+            // not a tail: it spans the image band, and the rungs are its steps.
+            OptimizeStage::Trial { step, total } => 0.08 + 0.72 * if total == 0 { 1.0 } else { step.min(total) as f32 / total as f32 },
             OptimizeStage::CleaningUp => 0.85,
             OptimizeStage::Merging => 0.90,
             OptimizeStage::Writing => 0.95,

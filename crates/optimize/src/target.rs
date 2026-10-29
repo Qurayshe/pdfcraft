@@ -79,6 +79,13 @@ fn rung(base: &Settings, (max_dimension, quality): (u32, u8)) -> Settings {
 /// changed. `progress` also gets a [`Stage::Trial`] before each rung; returning `false` stops
 /// with [`OptimizeError::Cancelled`].
 ///
+/// A document whose own save is already within `target_bytes` is returned as it is: no rung is
+/// tried (`trials` is empty), because even the sharpest rung re-encodes every image and could
+/// make the file larger.
+///
+/// Each rung is a whole optimization of the document (fragments, flattening, every image), so a
+/// search costs up to ceil(log2([`LADDER`].len())) of those: five passes at most.
+///
 /// The size is the optimizer's own full save (object streams as `base` says), which the caller's
 /// save of the returned document matches or, with extra clean-up such as merging identical
 /// objects, undercuts.
@@ -88,6 +95,20 @@ pub fn optimize_to_target(
     target_bytes: u64,
     progress: &mut dyn FnMut(Stage) -> bool,
 ) -> Result<TargetOutcome, OptimizeError> {
+    // Nothing to search for when the document already fits: every rung re-encodes its images, so
+    // the sharpest one could well be larger than the file as it is.
+    let unchanged_opts = SaveOptions { object_streams: base.effective_object_streams(), ..SaveOptions::default() };
+    let unchanged = write_full(doc, &unchanged_opts)?.len();
+    if unchanged as u64 <= target_bytes {
+        return Ok(TargetOutcome {
+            doc: doc.clone(),
+            settings: base.clone(),
+            report: Report::default(),
+            trials: Vec::new(),
+            bytes: unchanged,
+            fits: true,
+        });
+    }
     let of = LADDER.len();
     let mut trials = Vec::new();
     let mut try_rung = |i: usize, trials: &mut Vec<Trial>| -> Result<(Document, Settings, Report, usize), OptimizeError> {
@@ -127,6 +148,8 @@ pub fn optimize_to_target(
     let (fits, (doc, settings, report, bytes)) = match (best, smallest) {
         (Some(b), _) => (true, b),
         (None, Some(s)) => (false, s),
+        // A backstop, not a path the search takes: the loop always tries the last rung, so a
+        // document too large for the whole ladder ends in `smallest`.
         (None, None) => (false, try_rung(of - 1, &mut trials)?),
     };
     Ok(TargetOutcome { doc, settings, report, trials, bytes, fits })

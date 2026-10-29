@@ -19,12 +19,14 @@
 //!
 //! The text stays text: searchable, selectable, sharp at any zoom. What it can't keep: the
 //! stacking of text under later drawing (text is drawn last), so a page where the artwork covers
-//! some text looks different. A page is left as it is when it:
+//! some text looks different, and the clip that text in a clipping render mode (4 to 7) puts on
+//! what is drawn after it. Such a text object stays in the picture (so the clip still shapes what
+//! the renderer draws) and in the overlay as `3 Tr` text, which paints nothing but stays
+//! searchable and selectable. A page is left as it is when it:
 //!
 //! - is rotated or has a `/UserUnit`, has a comment or other markup annotation (the renderer
 //!   draws annotations, which would then show twice), or an unreadable content stream;
-//! - draws a form XObject that holds text (the text isn't in the page's own content), or uses a
-//!   text render mode that clips (4 to 7);
+//! - draws a form XObject that holds text (the text isn't in the page's own content);
 //! - would not get smaller (the picture is not smaller than the images it replaces);
 //! - is in an encrypted document (the renderer is given the document as written).
 
@@ -48,7 +50,10 @@ const MAX_FLATTEN_DIMENSION: u32 = 8192;
 /// Deepest nested Type 3 font or form XObject chain followed when checking glyph resources.
 const MAX_TYPE3_DEPTH: usize = 12;
 
-/// Most font and form steps evaluated while walking Type 3 glyph resources (bounds traversal).
+/// Most page `/XObject` entries followed while walking Type 3 glyph resources (a backstop against a
+/// hostile resource dictionary). What a font's own glyph programs do is bounded by the page's
+/// `DecodeBudget`, [`MAX_TYPE3_DEPTH`] and one walk per program per font, so a font with tens of
+/// thousands of glyphs is walked like any other instead of being left unflattened.
 const MAX_TYPE3_STEPS: usize = 10_000;
 
 /// Why a tiled page is left as it is.
@@ -62,8 +67,6 @@ pub enum Skip {
     Annotations,
     /// A form XObject the page draws holds text.
     FormText,
-    /// The page uses a text render mode that clips.
-    TextClip,
     /// The content stream, or a form's, can't be read back exactly.
     UnreadableContent,
     /// The picture would not be smaller than the images it replaces.
@@ -82,7 +85,6 @@ impl Skip {
             Skip::UserUnit => "page has a UserUnit",
             Skip::Annotations => "page has markup annotations",
             Skip::FormText => "a form XObject holds text",
-            Skip::TextClip => "text used as a clipping path",
             Skip::UnreadableContent => "content stream not readable",
             Skip::NoGain => "would not get smaller",
             Skip::RenderFailed => "page could not be rendered",
@@ -195,9 +197,14 @@ impl<'a> Type3Walk<'a> {
             self.check_fonts(&inner_fonts, &font_scopes, depth + 1)?;
         }
         let char_procs = Self::dict_opt(self.doc, font_dict.get(b"CharProcs"))?.ok_or(Skip::UnreadableContent)?;
+        // A glyph program this font shares between several glyphs is walked once.
+        let mut walked = HashSet::new();
         for (_, proc_obj) in char_procs.iter() {
             let resolved_proc = self.doc.resolve(proc_obj);
             let Object::Stream(proc_stream) = &*resolved_proc else { return Err(Skip::UnreadableContent) };
+            if proc_obj.as_ref().is_some_and(|r| !walked.insert(r)) {
+                continue;
+            }
             let proc_res = Self::dict_opt(self.doc, proc_stream.dict.get(b"Resources"))?;
             let proc_xobj = Self::dict_opt(self.doc, proc_res.as_ref().and_then(|r| r.get(b"XObject")))?;
             let mut proc_scopes = font_scopes.clone();
@@ -231,11 +238,15 @@ impl<'a> Type3Walk<'a> {
     }
 
     fn walk_do(&mut self, name: &[u8], local_xobjects: &[Dict], depth: usize) -> Result<(), Skip> {
-        self.step()?;
         let local_hit = local_xobjects.iter().rev().find_map(|d| d.get(name)).cloned();
         let entry = if let Some(e) = local_hit {
             Some(e)
         } else if let Some(e) = self.page_xobjects.get(name).cloned() {
+            // Only the page-level fan-out is counted. A glyph program that draws images of its own
+            // (bitmap Type 3 fonts do, one per glyph) is bounded by the decode budget, depth and
+            // seen set; the page's XObject dictionary is what one entry per glyph could make this
+            // walk visit forever.
+            self.step()?;
             if let Some(r) = e.as_ref() {
                 self.kept_refs.insert(r);
             }
@@ -884,6 +895,73 @@ mod tests {
         let detected = detect_tiled_pages(&doc, 8);
         assert_eq!(detected.len(), 1);
         assert_eq!(detected[0].skip, Some(Skip::UnreadableContent));
+    }
+
+    #[test]
+    fn a_bitmap_type3_font_with_many_glyph_programs_still_flattens() {
+        let mut doc = Document::new_empty();
+        let mut xobjects = Dict::new();
+        let mut content_ops = String::new();
+        for i in 0..8 {
+            let tile = add_rgb_image(&mut doc, 40, 40, (i * 25) as u8);
+            let name = format!("T{i}");
+            xobjects.set(name.as_bytes().to_vec(), Object::Ref(tile));
+            let x = (i % 4) * 20;
+            let y = (i / 4) * 20;
+            content_ops.push_str(&format!("q 20 0 0 20 {x} {y} cm /{name} Do Q\n"));
+        }
+        content_ops.push_str("BT /T3 4 Tf 10 50 Td (AAAA) Tj ET\n");
+
+        // One image per glyph program, in the font's own resources: the shape a scanned or exported
+        // bitmap Type 3 font has, with more glyph programs than the page-level step backstop.
+        let glyph_img = add_rgb_image(&mut doc, 2, 2, 90);
+        let mut glyph_xobjects = Dict::new();
+        glyph_xobjects.set(b"Im".to_vec(), Object::Ref(glyph_img));
+        let mut procs = Dict::new();
+        for i in 0..MAX_TYPE3_STEPS + 16 {
+            let proc = doc.add(Object::Stream(Stream::from_raw(Dict::new(), b"q 1 0 0 1 0 0 cm /Im Do Q".to_vec())));
+            procs.set(format!("g{i}").into_bytes(), Object::Ref(proc));
+        }
+        let mut font_res = Dict::new();
+        font_res.set(b"XObject".to_vec(), Object::Dict(glyph_xobjects));
+
+        let mut t3 = Dict::new();
+        t3.set(b"Type".to_vec(), Object::name("Font"));
+        t3.set(b"Subtype".to_vec(), Object::name("Type3"));
+        t3.set(b"CharProcs".to_vec(), Object::Dict(procs));
+        t3.set(b"Resources".to_vec(), Object::Dict(font_res));
+        let mut fonts = Dict::new();
+        fonts.set(b"T3".to_vec(), Object::Dict(t3));
+
+        let mut res = Dict::new();
+        res.set(b"XObject".to_vec(), Object::Dict(xobjects));
+        res.set(b"Font".to_vec(), Object::Dict(fonts));
+
+        let contents_ref = doc.add(Object::Stream(Stream::from_raw(Dict::new(), content_ops.into_bytes())));
+        let pages_ref = doc.add(Object::Dict(Dict::new()));
+        let mut page_dict = Dict::new();
+        page_dict.set(b"Type".to_vec(), Object::name("Page"));
+        page_dict.set(b"Parent".to_vec(), Object::Ref(pages_ref));
+        page_dict.set(b"MediaBox".to_vec(), Object::Array(vec![0.into(), 0.into(), 200.into(), 200.into()]));
+        page_dict.set(b"Resources".to_vec(), Object::Dict(res));
+        page_dict.set(b"Contents".to_vec(), Object::Ref(contents_ref));
+        let page_ref = doc.add(Object::Dict(page_dict));
+
+        let mut pages_dict = Dict::new();
+        pages_dict.set(b"Type".to_vec(), Object::name("Pages"));
+        pages_dict.set(b"Kids".to_vec(), Object::Array(vec![Object::Ref(page_ref)]));
+        pages_dict.set(b"Count".to_vec(), Object::Int(1));
+        doc.set(pages_ref, Object::Dict(pages_dict));
+
+        let mut cat = Dict::new();
+        cat.set(b"Type".to_vec(), Object::name("Catalog"));
+        cat.set(b"Pages".to_vec(), Object::Ref(pages_ref));
+        let cat_ref = doc.add(Object::Dict(cat));
+        doc.trailer_mut().set(b"Root".to_vec(), Object::Ref(cat_ref));
+
+        let detected = detect_tiled_pages(&doc, 8);
+        assert_eq!(detected.len(), 1);
+        assert_eq!(detected[0].skip, None, "glyph programs of the font's own must not count against the page-level step backstop");
     }
 }
 
