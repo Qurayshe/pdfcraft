@@ -864,20 +864,21 @@ fn samples(doc: &Document, s: &Stream, desc: &Desc) -> Option<Vec<u8>> {
             if w == 0 || h == 0 || u64::from(w) * u64::from(h) > MAX_PIXELS {
                 return None;
             }
-            let (w, h, n) = (usize::try_from(w).ok()?, usize::try_from(h).ok()?, desc.n);
-            let row = w.checked_mul(*bpc)?.div_ceil(8);
-            let data = s.decoded().ok()?;
-            if data.len() < row.checked_mul(h)? {
+            let (w_px, h_px, n) = (usize::try_from(w).ok()?, usize::try_from(h).ok()?, desc.n);
+            let row = w_px.checked_mul(*bpc)?.div_ceil(8);
+            let needed = row.checked_mul(h_px)?;
+            let data = doc.with_direct_parms(s).decoded_within(allowance(needed, h)?).ok()?;
+            if data.len() < needed {
                 return None;
             }
             let mut out = Vec::new();
-            out.try_reserve_exact(w.checked_mul(h)?.checked_mul(n)?).ok()?;
+            out.try_reserve_exact(w_px.checked_mul(h_px)?.checked_mul(n)?).ok()?;
             let per_byte = 8 / bpc;
             let mask = (1usize << bpc) - 1;
-            for y in 0..h {
+            for y in 0..h_px {
                 let start = y.checked_mul(row)?;
                 let line = data.get(start..start.checked_add(row)?)?;
-                for x in 0..w {
+                for x in 0..w_px {
                     let byte = usize::from(*line.get(x / per_byte)?);
                     let shift = 8 - bpc * (x % per_byte + 1);
                     let idx = ((byte >> shift) & mask).min(*hival);
@@ -885,6 +886,7 @@ fn samples(doc: &Document, s: &Stream, desc: &Desc) -> Option<Vec<u8>> {
                     out.extend_from_slice(palette.get(p_start..p_start.checked_add(n)?)?);
                 }
             }
+            count_decoded(u64::from(w) * u64::from(h));
             Some(out)
         }
     }
@@ -1518,6 +1520,43 @@ mod tests {
         let contents = Object::Array(vec![Object::Ref(stream); 300]);
         let data = super::content_bytes(&doc, &contents, &mut DecodeBudget::page());
         assert!(data.is_none_or(|d| d.len() <= MAX_PAGE_DECODED + 300));
+    }
+
+    #[test]
+    fn indexed_image_sample_decoding_is_bounded_by_allowance() {
+        let mut doc = Document::new_empty();
+        let cs = Object::Array(vec![
+            Object::name("Indexed"),
+            Object::name("DeviceRGB"),
+            1.into(),
+            Object::String(vec![255, 0, 0, 0, 255, 0].into()),
+        ]);
+
+        let mut valid_dict = Dict::new();
+        valid_dict.set(b"Type".to_vec(), Object::name("XObject"));
+        valid_dict.set(b"Subtype".to_vec(), Object::name("Image"));
+        valid_dict.set(b"Width".to_vec(), Object::Int(2));
+        valid_dict.set(b"Height".to_vec(), Object::Int(2));
+        valid_dict.set(b"BitsPerComponent".to_vec(), Object::Int(8));
+        valid_dict.set(b"ColorSpace".to_vec(), cs.clone());
+        let valid_stream = Stream::from_raw(valid_dict, vec![0, 1, 1, 0]);
+
+        let desc = super::describe(&doc, &valid_stream, true).unwrap();
+        let px = super::samples(&doc, &valid_stream, &desc);
+        assert_eq!(px, Some(vec![255, 0, 0, 0, 255, 0, 0, 255, 0, 255, 0, 0]));
+
+        // Stream whose decoded data exceeds the row allowance returns None.
+        let mut bomb_dict = Dict::new();
+        bomb_dict.set(b"Type".to_vec(), Object::name("XObject"));
+        bomb_dict.set(b"Subtype".to_vec(), Object::name("Image"));
+        bomb_dict.set(b"Width".to_vec(), Object::Int(2));
+        bomb_dict.set(b"Height".to_vec(), Object::Int(2));
+        bomb_dict.set(b"BitsPerComponent".to_vec(), Object::Int(8));
+        bomb_dict.set(b"ColorSpace".to_vec(), cs);
+        let bomb_stream = Stream::from_raw(bomb_dict, vec![0; 50_000]);
+
+        let desc_bomb = super::describe(&doc, &bomb_stream, true).unwrap();
+        assert_eq!(super::samples(&doc, &bomb_stream, &desc_bomb), None);
     }
 }
 

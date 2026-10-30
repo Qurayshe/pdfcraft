@@ -126,13 +126,13 @@ fn area(r: &[f64; 4]) -> f64 {
     ((r[2] - r[0]).max(0.0)) * ((r[3] - r[1]).max(0.0))
 }
 
-/// Whether the page has an annotation that is drawn and isn't a link or form control.
+/// Whether the page has an annotation that is drawn and isn't a Link or Popup (such as markup, stamps, or form widgets).
 fn has_markup_annots(doc: &Document, page: &Page) -> bool {
     let Some(annots) = page.dict.get(b"Annots").map(|a| doc.resolve(a)) else { return false };
     let Some(list) = annots.as_array() else { return false };
     list.iter().any(|a| {
         let a = doc.resolve(a);
-        a.as_dict().is_some_and(|d| !matches!(d.name(b"Subtype"), Some(b"Link" | b"Popup" | b"Widget")))
+        a.as_dict().is_some_and(|d| !matches!(d.name(b"Subtype"), Some(b"Link" | b"Popup")))
     })
 }
 
@@ -975,6 +975,57 @@ mod tests {
         let detected = detect_tiled_pages(&doc, 8);
         assert_eq!(detected.len(), 1);
         assert_eq!(detected[0].skip, None, "glyph programs of the font's own must not count against the page-level step backstop");
+    }
+
+    #[test]
+    fn page_with_widget_annotation_skips_flattening() {
+        let mut doc = Document::new_empty();
+        let mut xobjects = Dict::new();
+        let mut content_ops = String::new();
+        for i in 0..8 {
+            let tile = add_rgb_image(&mut doc, 40, 40, (i * 25) as u8);
+            let name = format!("T{i}");
+            xobjects.set(name.as_bytes().to_vec(), Object::Ref(tile));
+            let x = (i % 4) * 20;
+            let y = (i / 4) * 20;
+            content_ops.push_str(&format!("q 20 0 0 20 {x} {y} cm /{name} Do Q\n"));
+        }
+
+        let mut res = Dict::new();
+        res.set(b"XObject".to_vec(), Object::Dict(xobjects));
+
+        let mut widget = Dict::new();
+        widget.set(b"Type".to_vec(), Object::name("Annot"));
+        widget.set(b"Subtype".to_vec(), Object::name("Widget"));
+        widget.set(b"Rect".to_vec(), Object::Array(vec![0.into(), 0.into(), 50.into(), 20.into()]));
+        let widget_ref = doc.add(Object::Dict(widget));
+
+        let contents_ref = doc.add(Object::Stream(Stream::from_raw(Dict::new(), content_ops.into_bytes())));
+        let pages_ref = doc.add(Object::Dict(Dict::new()));
+        let mut page_dict = Dict::new();
+        page_dict.set(b"Type".to_vec(), Object::name("Page"));
+        page_dict.set(b"Parent".to_vec(), Object::Ref(pages_ref));
+        page_dict.set(b"MediaBox".to_vec(), Object::Array(vec![0.into(), 0.into(), 200.into(), 200.into()]));
+        page_dict.set(b"Resources".to_vec(), Object::Dict(res));
+        page_dict.set(b"Contents".to_vec(), Object::Ref(contents_ref));
+        page_dict.set(b"Annots".to_vec(), Object::Array(vec![Object::Ref(widget_ref)]));
+        let page_ref = doc.add(Object::Dict(page_dict));
+
+        let mut pages_dict = Dict::new();
+        pages_dict.set(b"Type".to_vec(), Object::name("Pages"));
+        pages_dict.set(b"Kids".to_vec(), Object::Array(vec![Object::Ref(page_ref)]));
+        pages_dict.set(b"Count".to_vec(), Object::Int(1));
+        doc.set(pages_ref, Object::Dict(pages_dict));
+
+        let mut cat = Dict::new();
+        cat.set(b"Type".to_vec(), Object::name("Catalog"));
+        cat.set(b"Pages".to_vec(), Object::Ref(pages_ref));
+        let cat_ref = doc.add(Object::Dict(cat));
+        doc.trailer_mut().set(b"Root".to_vec(), Object::Ref(cat_ref));
+
+        let detected = detect_tiled_pages(&doc, 8);
+        assert_eq!(detected.len(), 1);
+        assert_eq!(detected[0].skip, Some(Skip::Annotations), "form widget annotation must cause page flattening to be skipped");
     }
 }
 
