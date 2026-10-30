@@ -27,3 +27,4 @@ zune-jpeg = "0.5"
 hayro-jpeg2000 = "0.3.5"
 
 [dev-dependencies]
+proptest.workspace = true

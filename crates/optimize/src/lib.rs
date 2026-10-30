@@ -16,7 +16,11 @@
 //!   replaces the old one only if it is smaller. Images PdfCraft can't decode faithfully (CMYK
 //!   and other colour spaces, masks, decode arrays other than the default, JBIG2, CCITT, other
 //!   than 8 bits for non-palette images, JPEGs whose Adobe marker and `/ColorTransform` disagree)
-//!   are left alone.
+//!   are left alone by these colour and grey settings. Black-and-white images (1-bit, image masks
+//!   and CCITT fax, Group 3 among them; and eight-bit grey and RGB of only black and white, and
+//!   indexed images that use only palette entries 0 and 1, packed to one bit) above a threshold are
+//!   averaged down to a target resolution, halftones and dithers aside, and are stored as CCITT
+//!   Group 4 or lossless JBIG2, or 1-bit Flate once resampled or packed, when that is smaller.
 //! - **Target file size:** when [`Settings::target_mb`] is set, [`optimize_to_target`] searches
 //!   [`LADDER`] by bisection to find the sharpest dimension and JPEG quality settings that fit
 //!   within the requested byte budget.
@@ -135,6 +139,37 @@ pub enum Compression {
     Retain,
 }
 
+/// How black-and-white (1-bit) images are stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MonoCompression {
+    /// CCITT Group 4 (lossless), when smaller than the image as it is.
+    CcittG4,
+    /// JBIG2, lossless (a generic region, or symbols when the image's marks repeat), when smaller
+    /// than the image as it is. JBIG2Decode is PDF 1.4: an older document gets `/Version /1.4` in
+    /// its catalog.
+    Jbig2,
+    /// Keep each image's own compression.
+    Retain,
+}
+
+/// How black-and-white images (1-bit, CCITT fax among them; and eight-bit grey and RGB of only black
+/// and white, and indexed images that use only palette entries 0 and 1, packed to one bit), and
+/// image masks, are resampled and stored.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MonoSettings {
+    /// Average images whose effective resolution is above `above_ppi` down to `target_ppi`.
+    pub downsample: bool,
+    pub target_ppi: f64,
+    pub above_ppi: f64,
+    pub compression: MonoCompression,
+}
+
+impl MonoSettings {
+    /// Reduce File Size and the presets: to 300 ppi above 450 ppi, CCITT Group 4. Text in a scan
+    /// stays sharp at 300 ppi.
+    pub const REDUCE: MonoSettings = MonoSettings { downsample: true, target_ppi: 300.0, above_ppi: 450.0, compression: MonoCompression::CcittG4 };
+}
+
 /// Acrobat's JPEG quality steps.
 pub const QUALITIES: [(&str, u8); 5] = [("Minimum", 25), ("Low", 45), ("Medium", 60), ("High", 80), ("Maximum", 95)];
 
@@ -202,6 +237,8 @@ pub struct Settings {
     /// Also optimize JPEG 2000 and palette (`/Indexed`) images, which are otherwise left alone:
     /// they are decoded (a palette to its base colour space) and stored like any other image.
     pub extended_formats: bool,
+    /// Black-and-white images, and image masks.
+    pub mono: MonoSettings,
     pub discard_thumbnails: bool,
     pub discard_alternate_images: bool,
     pub discard_tags: bool,
@@ -242,6 +279,7 @@ impl Default for Settings {
             gray: ImageSettings::REDUCE,
             max_image_dimension: None,
             extended_formats: false,
+            mono: MonoSettings::REDUCE,
             discard_thumbnails: true,
             discard_alternate_images: true,
             discard_tags: false,
@@ -637,7 +675,7 @@ fn strip_ascii_wrapper(s: &Stream) -> Option<Stream> {
 
 /// Bytes the stream object takes in the file: its dictionary with `/Length` set as the writer
 /// sets it, then its data.
-fn stored_len(s: &Stream) -> Option<usize> {
+pub(crate) fn stored_len(s: &Stream) -> Option<usize> {
     let mut dict = s.dict.clone();
     dict.set(b"Length".to_vec(), Object::Int(i64::try_from(s.raw.len()).ok()?));
     let mut out = Vec::new();
