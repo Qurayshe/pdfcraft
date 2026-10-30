@@ -60,11 +60,15 @@ pub struct TargetOutcome {
 
 /// `base` with rung `(max_dimension, quality)` applied: the longest side images and flattened
 /// pages keep, and the JPEG quality of both (an image setting that isn't JPEG stays as it is).
+///
+/// If `base` has an explicit [`Settings::max_image_dimension`], the stricter (smaller) cap is
+/// preserved so a large rung cannot widen the caller's ceiling.
 fn rung(base: &Settings, (max_dimension, quality): (u32, u8)) -> Settings {
     let mut s = base.clone();
     s.target_mb = None;
-    s.max_image_dimension = Some(max_dimension);
-    s.flatten_tiles.max_dimension = max_dimension;
+    let dim = base.max_image_dimension.map_or(max_dimension, |b| b.min(max_dimension));
+    s.max_image_dimension = Some(dim);
+    s.flatten_tiles.max_dimension = dim;
     s.flatten_tiles.quality = quality;
     for image in [&mut s.color, &mut s.gray] {
         if matches!(image.compression, Compression::Jpeg(_)) {
@@ -180,5 +184,19 @@ mod tests {
         let mut base = Settings::default();
         base.color.compression = Compression::Flate;
         assert_eq!(rung(&base, (800, 42)).color.compression, Compression::Flate);
+    }
+
+    #[test]
+    fn a_rung_preserves_stricter_caller_max_image_dimension() {
+        let mut base = crate::Preset::Presentation.settings();
+        base.max_image_dimension = Some(1024);
+        let s = rung(&base, (3840, 85));
+        assert_eq!(s.max_image_dimension, Some(1024));
+        assert_eq!(s.flatten_tiles.max_dimension, 1024);
+
+        // When rung dimension is smaller than base, the tighter rung dimension is used.
+        let s2 = rung(&base, (800, 42));
+        assert_eq!(s2.max_image_dimension, Some(800));
+        assert_eq!(s2.flatten_tiles.max_dimension, 800);
     }
 }

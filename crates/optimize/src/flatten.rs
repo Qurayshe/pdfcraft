@@ -150,12 +150,16 @@ struct Type3Walk<'a> {
 }
 
 impl<'a> Type3Walk<'a> {
-    fn step(&mut self) -> Result<(), Skip> {
-        self.steps = self.steps.saturating_add(1);
+    fn charge(&mut self, n: usize) -> Result<(), Skip> {
+        self.steps = self.steps.saturating_add(n);
         if self.steps > MAX_TYPE3_STEPS {
             return Err(Skip::UnreadableContent);
         }
         Ok(())
+    }
+
+    fn step(&mut self) -> Result<(), Skip> {
+        self.charge(1)
     }
 
     fn dict_opt(doc: &Document, obj: Option<&Object>) -> Result<Option<Dict>, Skip> {
@@ -189,6 +193,7 @@ impl<'a> Type3Walk<'a> {
         }
         let font_res = Self::dict_opt(self.doc, font_dict.get(b"Resources"))?;
         let font_xobj = Self::dict_opt(self.doc, font_res.as_ref().and_then(|r| r.get(b"XObject")))?;
+        self.charge(local_xobjects.len())?;
         let mut font_scopes = local_xobjects.to_vec();
         if let Some(fx) = font_xobj {
             font_scopes.push(fx);
@@ -207,14 +212,19 @@ impl<'a> Type3Walk<'a> {
             }
             let proc_res = Self::dict_opt(self.doc, proc_stream.dict.get(b"Resources"))?;
             let proc_xobj = Self::dict_opt(self.doc, proc_res.as_ref().and_then(|r| r.get(b"XObject")))?;
-            let mut proc_scopes = font_scopes.clone();
-            if let Some(px) = proc_xobj {
+            let mut proc_scopes;
+            let scopes_ref: &[Dict] = if let Some(px) = proc_xobj {
+                self.charge(font_scopes.len())?;
+                proc_scopes = font_scopes.clone();
                 proc_scopes.push(px);
-            }
+                &proc_scopes
+            } else {
+                &font_scopes
+            };
             if let Some(inner_fonts) = Self::dict_opt(self.doc, proc_res.as_ref().and_then(|r| r.get(b"Font")))? {
-                self.check_fonts(&inner_fonts, &proc_scopes, depth + 1)?;
+                self.check_fonts(&inner_fonts, scopes_ref, depth + 1)?;
             }
-            self.walk_stream(proc_stream, &proc_scopes, depth + 1)?;
+            self.walk_stream(proc_stream, scopes_ref, depth + 1)?;
         }
         Ok(())
     }
@@ -241,19 +251,17 @@ impl<'a> Type3Walk<'a> {
         let local_hit = local_xobjects.iter().rev().find_map(|d| d.get(name)).cloned();
         let entry = if let Some(e) = local_hit {
             Some(e)
-        } else if let Some(e) = self.page_xobjects.get(name).cloned() {
-            // Only the page-level fan-out is counted. A glyph program that draws images of its own
-            // (bitmap Type 3 fonts do, one per glyph) is bounded by the decode budget, depth and
-            // seen set; the page's XObject dictionary is what one entry per glyph could make this
-            // walk visit forever.
-            self.step()?;
-            if let Some(r) = e.as_ref() {
-                self.kept_refs.insert(r);
-            }
-            self.kept.set(name.to_vec(), e.clone());
-            Some(e)
         } else {
-            None
+            self.step()?;
+            if let Some(e) = self.page_xobjects.get(name).cloned() {
+                if let Some(r) = e.as_ref() {
+                    self.kept_refs.insert(r);
+                }
+                self.kept.set(name.to_vec(), e.clone());
+                Some(e)
+            } else {
+                None
+            }
         };
         let Some(entry) = entry else { return Ok(()) };
         let resolved_x = self.doc.resolve(&entry);
@@ -266,14 +274,19 @@ impl<'a> Type3Walk<'a> {
         }
         let form_res = Self::dict_opt(self.doc, s.dict.get(b"Resources"))?;
         let form_xobj = Self::dict_opt(self.doc, form_res.as_ref().and_then(|r| r.get(b"XObject")))?;
-        let mut form_scopes = local_xobjects.to_vec();
-        if let Some(fx) = form_xobj {
+        let mut form_scopes;
+        let scopes_ref: &[Dict] = if let Some(fx) = form_xobj {
+            self.charge(local_xobjects.len())?;
+            form_scopes = local_xobjects.to_vec();
             form_scopes.push(fx);
-        }
+            &form_scopes
+        } else {
+            local_xobjects
+        };
         if let Some(inner_fonts) = Self::dict_opt(self.doc, form_res.as_ref().and_then(|r| r.get(b"Font")))? {
-            self.check_fonts(&inner_fonts, &form_scopes, depth + 1)?;
+            self.check_fonts(&inner_fonts, scopes_ref, depth + 1)?;
         }
-        self.walk_stream(s, &form_scopes, depth + 1)
+        self.walk_stream(s, scopes_ref, depth + 1)
     }
 }
 
