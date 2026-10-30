@@ -71,7 +71,9 @@ fn main() {
         }
         "target" => {
             let target: f64 = args.get(4).and_then(|t| t.parse().ok()).unwrap_or_else(|| fail("missing target size in MB"));
-            let outcome = optimize_to_target(&doc, &preset.settings(), (target * 1024.0 * 1024.0) as u64, &mut progress).unwrap_or_else(|e| fail(&format!("{e}")));
+            let target_bytes = (target * 1024.0 * 1024.0) as u64;
+            let outcome = optimize_to_target(&doc, &preset.settings(), target_bytes, &mut progress)
+                .unwrap_or_else(|e| fail(&format!("{e}")));
             eprintln!();
             for t in &outcome.trials {
                 println!("  tried longest side {:>4} px, JPEG quality {:>2}: {:.2} MB", t.max_dimension, t.quality, mb(t.bytes));
