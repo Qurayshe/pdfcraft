@@ -121,7 +121,6 @@ impl OptimizeJob {
             optimize::OptimizeError::Cancelled => EditError::Cancelled,
             e => EditError::Optimize(e.to_string()),
         })?;
-        active_trial = None;
         step(OptimizeStage::Merging)?;
         let all: Vec<pdfcraft_cos::ObjRef> = cos.object_numbers().into_iter().map(|n| pdfcraft_cos::ObjRef::new(n, cos.generation(n))).collect();
         let merged = pdfcraft_organize::dedupe_resources(&mut cos, &all, false);

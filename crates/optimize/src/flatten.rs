@@ -30,7 +30,7 @@
 //! - would not get smaller (the picture is not smaller than the images it replaces);
 //! - is in an encrypted document (the renderer is given the document as written).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use pdfcraft_content::{Op, parse, serialize_ops};
@@ -350,9 +350,23 @@ fn inspect(doc: &Document, page: &Page, draws: &PageDraws) -> Result<(Vec<Op>, D
 /// Every page that draws at least `min_images` images, most of them small, with how it is made
 /// and whether flattening could handle it.
 fn scan(doc: &Document, min_images: usize) -> Vec<Scanned> {
-    let mut out = Vec::new();
-    for (index, page) in pdfcraft_model::pages(doc).into_iter().enumerate() {
+    let pages = pdfcraft_model::pages(doc);
+    let mut total_uses: HashMap<ObjRef, usize> = HashMap::new();
+    let mut page_data = Vec::with_capacity(pages.len());
+    for (index, page) in pages.into_iter().enumerate() {
         let draws = page_draws(doc, page.obj);
+        let mut seen = HashSet::new();
+        for d in &draws.draws {
+            if seen.insert(d.image) {
+                *total_uses.entry(d.image).or_default() += 1;
+            }
+        }
+        page_data.push((index, page, draws));
+    }
+
+    let mut candidate_pages = Vec::new();
+    let mut planned_uses: HashMap<ObjRef, usize> = HashMap::new();
+    for (index, page, draws) in page_data {
         if draws.draws.len() < min_images.max(1) {
             continue;
         }
@@ -380,15 +394,36 @@ fn scan(doc: &Document, min_images: usize) -> Vec<Scanned> {
         }
         let coverage = draws.draws.iter().map(|d| area(&d.rect)).filter(|a| a.is_finite()).sum::<f64>() / page_area;
         let inspected = inspect(doc, &page, &draws);
+        if inspected.is_ok() {
+            let kept_refs = inspected.as_ref().map(|(_, _, r)| r);
+            let mut seen = HashSet::new();
+            for d in &draws.draws {
+                if !kept_refs.is_some_and(|k| k.contains(&d.image)) && seen.insert(d.image) {
+                    *planned_uses.entry(d.image).or_default() += 1;
+                }
+            }
+        }
+        candidate_pages.push((index, page, draws, tiles.len(), touching, coverage, inspected));
+    }
+
+    let mut out = Vec::with_capacity(candidate_pages.len());
+    for (index, page, draws, tiles_len, touching, coverage, inspected) in candidate_pages {
         let kept_refs = inspected.as_ref().map(|(_, _, r)| r);
         let mut seen = HashSet::new();
         let image_bytes = draws
             .draws
             .iter()
             .filter(|d| !kept_refs.is_some_and(|k| k.contains(&d.image)) && seen.insert(d.image))
-            .map(|d| match &*doc.get(d.image) {
-                Object::Stream(s) => s.raw.len(),
-                _ => 0,
+            .map(|d| {
+                let total = total_uses.get(&d.image).copied().unwrap_or(1);
+                let planned = planned_uses.get(&d.image).copied().unwrap_or(0);
+                if planned < total {
+                    return 0;
+                }
+                match &*doc.get(d.image) {
+                    Object::Stream(s) => s.raw.len() / planned.max(1),
+                    _ => 0,
+                }
             })
             .fold(0usize, usize::saturating_add);
         let ops = inspected.map(|(ops, kept, _)| (ops, kept));
@@ -396,7 +431,7 @@ fn scan(doc: &Document, min_images: usize) -> Vec<Scanned> {
             index,
             page: page.obj,
             images: draws.draws.len(),
-            tiles: tiles.len(),
+            tiles: tiles_len,
             touching,
             coverage,
             skip: ops.as_ref().err().copied(),
@@ -1037,6 +1072,136 @@ mod tests {
         let detected = detect_tiled_pages(&doc, 8);
         assert_eq!(detected.len(), 1);
         assert_eq!(detected[0].skip, Some(Skip::Annotations), "form widget annotation must cause page flattening to be skipped");
+    }
+
+    #[test]
+    fn shared_images_across_flattened_pages_attribute_savings_fairly() {
+        let mut doc = Document::new_empty();
+        let mut xobjects = Dict::new();
+        let mut content_ops = String::new();
+        let mut total_bytes = 0usize;
+        for i in 0..8 {
+            let tile = add_rgb_image(&mut doc, 40, 40, (i * 25) as u8);
+            let name = format!("T{i}");
+            xobjects.set(name.as_bytes().to_vec(), Object::Ref(tile));
+            let x = (i % 4) * 20;
+            let y = (i / 4) * 20;
+            content_ops.push_str(&format!("q 20 0 0 20 {x} {y} cm /{name} Do Q\n"));
+            if let Object::Stream(s) = &*doc.get(tile) {
+                total_bytes += s.raw.len();
+            }
+        }
+
+        let mut res = Dict::new();
+        res.set(b"XObject".to_vec(), Object::Dict(xobjects));
+        let res_ref = doc.add(Object::Dict(res));
+
+        let contents1 = doc.add(Object::Stream(Stream::from_raw(Dict::new(), content_ops.clone().into_bytes())));
+        let contents2 = doc.add(Object::Stream(Stream::from_raw(Dict::new(), content_ops.into_bytes())));
+
+        let pages_ref = doc.add(Object::Dict(Dict::new()));
+
+        let mut p1 = Dict::new();
+        p1.set(b"Type".to_vec(), Object::name("Page"));
+        p1.set(b"Parent".to_vec(), Object::Ref(pages_ref));
+        p1.set(b"MediaBox".to_vec(), Object::Array(vec![0.into(), 0.into(), 200.into(), 200.into()]));
+        p1.set(b"Resources".to_vec(), Object::Ref(res_ref));
+        p1.set(b"Contents".to_vec(), Object::Ref(contents1));
+        let page1 = doc.add(Object::Dict(p1));
+
+        let mut p2 = Dict::new();
+        p2.set(b"Type".to_vec(), Object::name("Page"));
+        p2.set(b"Parent".to_vec(), Object::Ref(pages_ref));
+        p2.set(b"MediaBox".to_vec(), Object::Array(vec![0.into(), 0.into(), 200.into(), 200.into()]));
+        p2.set(b"Resources".to_vec(), Object::Ref(res_ref));
+        p2.set(b"Contents".to_vec(), Object::Ref(contents2));
+        let page2 = doc.add(Object::Dict(p2));
+
+        let mut pages_dict = Dict::new();
+        pages_dict.set(b"Type".to_vec(), Object::name("Pages"));
+        pages_dict.set(b"Kids".to_vec(), Object::Array(vec![Object::Ref(page1), Object::Ref(page2)]));
+        pages_dict.set(b"Count".to_vec(), Object::Int(2));
+        doc.set(pages_ref, Object::Dict(pages_dict));
+
+        let mut cat = Dict::new();
+        cat.set(b"Type".to_vec(), Object::name("Catalog"));
+        cat.set(b"Pages".to_vec(), Object::Ref(pages_ref));
+        let cat_ref = doc.add(Object::Dict(cat));
+        doc.trailer_mut().set(b"Root".to_vec(), Object::Ref(cat_ref));
+
+        let scanned = scan(&doc, 8);
+        assert_eq!(scanned.len(), 2);
+        assert_eq!(scanned[0].image_bytes, total_bytes / 2);
+        assert_eq!(scanned[1].image_bytes, total_bytes / 2);
+    }
+
+    #[test]
+    fn shared_images_with_unflattened_page_yield_zero_savings() {
+        let mut doc = Document::new_empty();
+        let mut xobjects = Dict::new();
+        let mut content_ops = String::new();
+        for i in 0..8 {
+            let tile = add_rgb_image(&mut doc, 40, 40, (i * 25) as u8);
+            let name = format!("T{i}");
+            xobjects.set(name.as_bytes().to_vec(), Object::Ref(tile));
+            let x = (i % 4) * 20;
+            let y = (i / 4) * 20;
+            content_ops.push_str(&format!("q 20 0 0 20 {x} {y} cm /{name} Do Q\n"));
+        }
+
+        let mut res = Dict::new();
+        res.set(b"XObject".to_vec(), Object::Dict(xobjects));
+        let res_ref = doc.add(Object::Dict(res));
+
+        let contents1 = doc.add(Object::Stream(Stream::from_raw(Dict::new(), content_ops.clone().into_bytes())));
+        let contents2 = doc.add(Object::Stream(Stream::from_raw(Dict::new(), content_ops.into_bytes())));
+
+        let mut widget = Dict::new();
+        widget.set(b"Type".to_vec(), Object::name("Annot"));
+        widget.set(b"Subtype".to_vec(), Object::name("Widget"));
+        widget.set(b"Rect".to_vec(), Object::Array(vec![0.into(), 0.into(), 50.into(), 20.into()]));
+        let widget_ref = doc.add(Object::Dict(widget));
+
+        let pages_ref = doc.add(Object::Dict(Dict::new()));
+
+        let mut p1 = Dict::new();
+        p1.set(b"Type".to_vec(), Object::name("Page"));
+        p1.set(b"Parent".to_vec(), Object::Ref(pages_ref));
+        p1.set(b"MediaBox".to_vec(), Object::Array(vec![0.into(), 0.into(), 200.into(), 200.into()]));
+        p1.set(b"Resources".to_vec(), Object::Ref(res_ref));
+        p1.set(b"Contents".to_vec(), Object::Ref(contents1));
+        let page1 = doc.add(Object::Dict(p1));
+
+        let mut p2 = Dict::new();
+        p2.set(b"Type".to_vec(), Object::name("Page"));
+        p2.set(b"Parent".to_vec(), Object::Ref(pages_ref));
+        p2.set(b"MediaBox".to_vec(), Object::Array(vec![0.into(), 0.into(), 200.into(), 200.into()]));
+        p2.set(b"Resources".to_vec(), Object::Ref(res_ref));
+        p2.set(b"Contents".to_vec(), Object::Ref(contents2));
+        p2.set(b"Annots".to_vec(), Object::Array(vec![Object::Ref(widget_ref)]));
+        let page2 = doc.add(Object::Dict(p2));
+
+        let mut pages_dict = Dict::new();
+        pages_dict.set(b"Type".to_vec(), Object::name("Pages"));
+        pages_dict.set(b"Kids".to_vec(), Object::Array(vec![Object::Ref(page1), Object::Ref(page2)]));
+        pages_dict.set(b"Count".to_vec(), Object::Int(2));
+        doc.set(pages_ref, Object::Dict(pages_dict));
+
+        let mut cat = Dict::new();
+        cat.set(b"Type".to_vec(), Object::name("Catalog"));
+        cat.set(b"Pages".to_vec(), Object::Ref(pages_ref));
+        let cat_ref = doc.add(Object::Dict(cat));
+        doc.trailer_mut().set(b"Root".to_vec(), Object::Ref(cat_ref));
+
+        let scanned = scan(&doc, 8);
+        assert_eq!(scanned.len(), 2);
+        // Page 1 is a candidate, but its tiles are shared with Page 2 which cannot be flattened (Skip::Annotations).
+        // Therefore, flattening Page 1 cannot free the tiles from the document, so image_bytes must be 0.
+        assert_eq!(scanned[0].image_bytes, 0);
+
+        let mut report = Report::default();
+        run(&mut doc, &FlattenSettings { enabled: true, min_images: 8, max_dimension: 200, quality: 70 }, &mut report, &mut |_| true).unwrap();
+        assert_eq!(report.pages_flattened, 0, "must not flatten when shared tiles cannot be deleted from the document");
     }
 }
 

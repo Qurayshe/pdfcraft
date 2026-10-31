@@ -114,15 +114,17 @@ pub fn optimize_to_target(
         });
     }
     let of = LADDER.len();
+    // Most rungs the bisection tries: ceil(log2(of + 1)).
+    let max_trials = (usize::BITS - of.leading_zeros()) as usize;
     let mut trials = Vec::new();
     let mut try_rung = |i: usize, trials: &mut Vec<Trial>| -> Result<(Document, Settings, Report, usize), OptimizeError> {
         let &(max_dimension, quality) = LADDER.get(i).ok_or(OptimizeError::NoPages)?;
-        if !progress(Stage::Trial { n: trials.len() + 1, of }) {
+        if !progress(Stage::Trial { n: trials.len() + 1, of: max_trials }) {
             return Err(OptimizeError::Cancelled);
         }
         let settings = rung(base, (max_dimension, quality));
         let mut copy = doc.clone();
-        let mut trial_progress = |_| progress(Stage::Trial { n: trials.len() + 1, of });
+        let mut trial_progress = |_| progress(Stage::Trial { n: trials.len() + 1, of: max_trials });
         let report = optimize_with_progress(&mut copy, &settings, &mut trial_progress)?;
         let opts = SaveOptions { object_streams: settings.effective_object_streams(), ..SaveOptions::default() };
         let bytes = write_full(&copy, &opts)?.len();
