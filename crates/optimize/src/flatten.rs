@@ -122,6 +122,7 @@ struct Scanned {
     image_bytes: usize,
 }
 
+/// The rectangular area of `[llx, lly, urx, ury]`, clamped to zero for inverted coordinates.
 fn area(r: &[f64; 4]) -> f64 {
     ((r[2] - r[0]).max(0.0)) * ((r[3] - r[1]).max(0.0))
 }
@@ -150,6 +151,7 @@ struct Type3Walk<'a> {
 }
 
 impl<'a> Type3Walk<'a> {
+    /// Charges `n` steps against [`MAX_TYPE3_STEPS`], aborting with [`Skip::UnreadableContent`] if exceeded.
     fn charge(&mut self, n: usize) -> Result<(), Skip> {
         self.steps = self.steps.saturating_add(n);
         if self.steps > MAX_TYPE3_STEPS {
@@ -158,10 +160,12 @@ impl<'a> Type3Walk<'a> {
         Ok(())
     }
 
+    /// Charges a single step against the traversal budget.
     fn step(&mut self) -> Result<(), Skip> {
         self.charge(1)
     }
 
+    /// Resolves `obj` if present and returns its dictionary, `None` for null or missing, or an error if unreadable.
     fn dict_opt(doc: &Document, obj: Option<&Object>) -> Result<Option<Dict>, Skip> {
         let Some(o) = obj else { return Ok(None) };
         match &*doc.resolve(o) {
@@ -171,6 +175,7 @@ impl<'a> Type3Walk<'a> {
         }
     }
 
+    /// Walks all font entries in `fonts` within [`MAX_TYPE3_DEPTH`], checking for Type 3 font definitions.
     fn check_fonts(&mut self, fonts: &Dict, local_xobjects: &[Dict], depth: usize) -> Result<(), Skip> {
         if depth > MAX_TYPE3_DEPTH {
             return Err(Skip::UnreadableContent);
@@ -181,6 +186,7 @@ impl<'a> Type3Walk<'a> {
         Ok(())
     }
 
+    /// Inspects a font object, traversing its glyph procedures and resources if it is a Type 3 font.
     fn check_font(&mut self, font_obj: &Object, local_xobjects: &[Dict], depth: usize) -> Result<(), Skip> {
         self.step()?;
         let resolved = self.doc.resolve(font_obj);
@@ -229,6 +235,7 @@ impl<'a> Type3Walk<'a> {
         Ok(())
     }
 
+    /// Parses a glyph procedure stream and inspects any `Do` invocations up to [`MAX_TYPE3_DEPTH`].
     fn walk_stream(&mut self, stream: &Stream, local_xobjects: &[Dict], depth: usize) -> Result<(), Skip> {
         if depth > MAX_TYPE3_DEPTH {
             return Err(Skip::UnreadableContent);
@@ -247,6 +254,7 @@ impl<'a> Type3Walk<'a> {
         Ok(())
     }
 
+    /// Checks an XObject invoked via `Do` in a glyph procedure, retaining it if resolved from page-level XObjects.
     fn walk_do(&mut self, name: &[u8], local_xobjects: &[Dict], depth: usize) -> Result<(), Skip> {
         let local_hit = local_xobjects.iter().rev().find_map(|d| d.get(name)).cloned();
         let entry = if let Some(e) = local_hit {
@@ -466,6 +474,7 @@ struct Plan {
     image_bytes: usize,
 }
 
+/// Restores original page content streams if any flattening step fails or is cancelled.
 fn restore(doc: &mut Document, plans: &[Plan]) -> Result<(), OptimizeError> {
     for p in plans {
         if let Some(original) = &p.original {
@@ -529,6 +538,7 @@ fn rgb_over_white(rgba: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Renders a page candidate to an image and replaces its content stream if the flattened JPEG is smaller.
 fn finish_plan(doc: &mut Document, renderer: &mut PageRenderer, plan: &Plan, settings: &FlattenSettings) -> Result<bool, OptimizeError> {
     let (w, h) = (plan.crop[2] - plan.crop[0], plan.crop[3] - plan.crop[1]);
     if !w.is_finite() || !h.is_finite() || w <= 0.0 || h <= 0.0 {
@@ -569,6 +579,7 @@ fn finish_plan(doc: &mut Document, renderer: &mut PageRenderer, plan: &Plan, set
     Ok(true)
 }
 
+/// Replaces eligible tiled pages with flattened pictures according to `settings`, updating `report` and `progress`.
 pub(crate) fn run(
     doc: &mut Document,
     settings: &FlattenSettings,

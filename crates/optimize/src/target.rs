@@ -143,7 +143,7 @@ pub fn optimize_to_target(
             }
             hi = mid - 1;
         } else {
-            if mid == of - 1 {
+            if smallest.as_ref().is_none_or(|s| tried.3 < s.3) {
                 smallest = Some(tried);
             }
             lo = mid + 1;

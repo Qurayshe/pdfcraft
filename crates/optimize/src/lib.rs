@@ -98,6 +98,7 @@ impl Compatibility {
         }
     }
 
+    /// Parses a compatibility version from a name string (e.g. "1.7" or "PDF 1.7").
     pub fn from_name(name: &str) -> Option<Compatibility> {
         let trimmed = name.trim();
         let stripped = if trimmed.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("pdf ")) { &trimmed[4..] } else { trimmed };
@@ -319,10 +320,12 @@ impl Preset {
         }
     }
 
+    /// Parse a preset from its tool or CLI name.
     pub fn from_name(name: &str) -> Option<Preset> {
         Preset::ALL.into_iter().find(|p| p.name() == name)
     }
 
+    /// The default optimization settings for this preset.
     pub fn settings(self) -> Settings {
         match self {
             Preset::Standard => Settings::default(),

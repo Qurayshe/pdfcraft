@@ -93,6 +93,7 @@ impl OptimizeJob {
         guard(move || self.work(&mut progress)).map_err(EditError::Optimize)?
     }
 
+    /// Performs the optimization workflow on `self.cos`, reporting progress through `progress`.
     fn work(self, progress: &mut dyn FnMut(OptimizeStage) -> bool) -> Result<Optimized, EditError> {
         let OptimizeJob { mut cos, settings, discard, opts } = self;
         // Like every file written, without the values of Password-flag fields (#3926, #3944).
@@ -103,19 +104,16 @@ impl OptimizeJob {
         let discarded = if discard.is_empty() { Vec::new() } else { pdfcraft_redact::sanitize::remove_hidden(&mut cos, &discard)? };
         let mut active_trial: Option<(usize, usize)> = None;
         let report = optimize::optimize_with_progress(&mut cos, &settings, &mut |s| {
-            let stage = match s {
-                optimize::Stage::Trial { n, of } => {
+            let stage = match (s, active_trial) {
+                (optimize::Stage::Trial { n, of }, _) => {
                     active_trial = Some((n, of));
                     OptimizeStage::Trial { step: n, total: of }
                 }
-                _ if active_trial.is_some() => {
-                    let (step, total) = active_trial.unwrap_or((1, 1));
-                    OptimizeStage::Trial { step, total }
-                }
-                optimize::Stage::Fragments => OptimizeStage::Fragments,
-                optimize::Stage::Flatten { done, total } => OptimizeStage::Flattening { done, total },
-                optimize::Stage::Images { done, total } => OptimizeStage::Images { done, total },
-                optimize::Stage::CleanUp => OptimizeStage::CleaningUp,
+                (_, Some((step, total))) => OptimizeStage::Trial { step, total },
+                (optimize::Stage::Fragments, None) => OptimizeStage::Fragments,
+                (optimize::Stage::Flatten { done, total }, None) => OptimizeStage::Flattening { done, total },
+                (optimize::Stage::Images { done, total }, None) => OptimizeStage::Images { done, total },
+                (optimize::Stage::CleanUp, None) => OptimizeStage::CleaningUp,
             };
             step(stage).is_ok()
         })
@@ -123,6 +121,7 @@ impl OptimizeJob {
             optimize::OptimizeError::Cancelled => EditError::Cancelled,
             e => EditError::Optimize(e.to_string()),
         })?;
+        active_trial = None;
         step(OptimizeStage::Merging)?;
         let all: Vec<pdfcraft_cos::ObjRef> = cos.object_numbers().into_iter().map(|n| pdfcraft_cos::ObjRef::new(n, cos.generation(n))).collect();
         let merged = pdfcraft_organize::dedupe_resources(&mut cos, &all, false);

@@ -472,6 +472,7 @@ pub(crate) fn components(doc: &Document, cs: &Object) -> Option<usize> {
     }
 }
 
+/// Whether the stream uses DCT (JPEG) compression, or `None` if its filters cannot be recognized.
 fn is_dct(s: &Stream) -> Option<bool> {
     match s.dict.get(b"Filter") {
         None => Some(false),
@@ -684,6 +685,7 @@ fn jpeg_samples(data: &[u8], w: usize, h: usize, n: usize, ycc: bool) -> Option<
     (px.len() == w.checked_mul(h)?.checked_mul(n)?).then_some(px)
 }
 
+/// Resamples pixel samples `px` of `n` components from `(w, h)` to `(nw, nh)` using bicubic interpolation.
 pub(crate) fn resample(px: &[u8], n: usize, w: u32, h: u32, nw: u32, nh: u32) -> Option<Vec<u8>> {
     use image::imageops::{FilterType, resize};
     Some(match n {
@@ -692,6 +694,7 @@ pub(crate) fn resample(px: &[u8], n: usize, w: u32, h: u32, nw: u32, nh: u32) ->
     })
 }
 
+/// Encodes pixel samples `px` of `n` components with dimension `(w, h)` as JPEG with `quality`.
 pub(crate) fn jpeg(px: &[u8], n: usize, w: u32, h: u32, quality: u8) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality.clamp(1, 100));
@@ -1197,6 +1200,7 @@ pub(crate) fn downsample_bits(data: &[u8], w: u32, h: u32, nw: u32, nh: u32, dar
     downsample_bits_checked(data, w, h, nw, nh, dark_is_one).map(|(out, mixed, _)| (out, mixed))
 }
 
+/// Downsamples 1-bit packed bitmap data from `(w, h)` to `(nw, nh)` taking the sample covering more area.
 fn downsample_bits_checked(data: &[u8], w: u32, h: u32, nw: u32, nh: u32, dark_is_one: bool) -> Option<(Vec<u8>, u64, bool)> {
     if nw == 0 || nh == 0 || nw > w || nh > h {
         return None;
@@ -1351,6 +1355,7 @@ fn mono(doc: &Document, s: &Stream, ppi: f64, defaults: bool, settings: &MonoSet
     (best.0 < crate::stored_len(s)?).then_some((best.1, resampled))
 }
 
+/// Runs image optimization across `pages` according to `settings`, updating `report` and `progress`.
 pub(crate) fn run(
     doc: &mut Document,
     pages: &[ObjRef],
