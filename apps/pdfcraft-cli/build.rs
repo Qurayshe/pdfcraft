@@ -26,16 +26,18 @@ fn main() {
         println!("cargo:rustc-link-arg-bins=delayimp.lib");
     }
     let mut res = winresource::WindowsResource::new();
-    res.set("ProductName", "PdfCraft")
-        .set("FileDescription", "PdfCraft command-line tool")
-        .set("LegalCopyright", "Copyright (c) the PdfCraft contributors. MIT OR Apache-2.0.")
-        .set("OriginalFilename", "pdfcraft-cli.exe")
-        .set("InternalName", "pdfcraft-cli");
+    res.set_icon("../../0logo/darknagalogo.ico")
+        .set("ProductName", "NagaPDF")
+        .set("CompanyName", "NAGA Architects")
+        .set("FileDescription", "NagaPDF command-line tool")
+        .set("LegalCopyright", "NagaPDF - NAGA Architects. Based on PdfCraft (MIT OR Apache-2.0).")
+        .set("OriginalFilename", "nagapdfcli.exe")
+        .set("InternalName", "nagapdfcli");
     if let Err(e) = res.compile() {
         if std::env::var_os("PDFCRAFT_REQUIRE_WINRES").is_some() {
             println!("cargo::error=embedding Windows resources failed: {e}");
             return;
         }
-        println!("cargo:warning=pdfcraft-cli.exe built without version resources: {e}");
+        println!("cargo:warning=nagapdfcli.exe built without version resources: {e}");
     }
 }

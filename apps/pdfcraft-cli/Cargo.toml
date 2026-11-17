@@ -1,12 +1,13 @@
 [package]
 name = "pdfcraft-cli"
-description = "PdfCraft command-line tool: inspect, render and robustness-check PDFs"
+description = "NagaPDF command-line tool: inspect, render and robustness-check PDFs"
+authors = ["NAGA Architects"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "pdfcraft-cli"
+name = "nagapdfcli"
 path = "src/main.rs"
 
 [lints]

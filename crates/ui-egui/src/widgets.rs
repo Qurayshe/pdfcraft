@@ -692,6 +692,7 @@ pub fn progress_notice(app: &PdfCraftApp, ctx: &egui::Context) -> bool {
 }
 
 /// The ArtCraft wordmark (Storyteller's brand, docs/brand/; not open source), sized to `height`.
+#[allow(dead_code)]
 pub fn artcraft_logo(ui: &mut egui::Ui, height: f32) -> Response {
     let dark = ui.visuals().dark_mode;
     let (uri, bytes): (&str, &'static [u8]) = if dark {
@@ -702,7 +703,34 @@ pub fn artcraft_logo(ui: &mut egui::Ui, height: f32) -> Response {
     ui.add(egui::Image::from_bytes(uri, bytes).max_height(height).alt_text("ArtCraft"))
 }
 
+/// The NagaPDF logo PNG bytes.
+pub const NAGA_LOGO_PNG: &[u8] = include_bytes!("../../../0logo/DarkNagaLogo.png");
+
+/// Load the Naga logo as an egui TextureHandle cached per egui::Context.
+pub fn naga_logo_texture(ctx: &egui::Context) -> egui::TextureHandle {
+    let id = egui::Id::unique("naga_pdf_logo_texture");
+    if let Some(tex) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
+        return tex;
+    }
+    let (w, h, rgba) = match eframe::icon_data::from_png_bytes(NAGA_LOGO_PNG) {
+        Ok(icon) => (icon.width as usize, icon.height as usize, icon.rgba),
+        Err(_) => (1, 1, vec![255, 255, 255, 255]),
+    };
+    let color_image = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+    let tex = ctx.load_texture("naga_logo", color_image, egui::TextureOptions::LINEAR);
+    ctx.data_mut(|d| d.insert_temp(id, tex.clone()));
+    tex
+}
+
+/// The NagaPDF logo, sized to `size` in height.
+pub fn naga_logo(ui: &mut egui::Ui, size: f32) -> Response {
+    let tex = naga_logo_texture(ui.ctx());
+    let aspect = 280.0 / 276.0;
+    ui.add(egui::Image::from_texture((tex.id(), tex.size_vec2())).fit_to_exact_size(vec2(size * aspect, size)))
+}
+
 /// The ArtCraft mark (brand blue, works on light and dark), `size` points square.
+#[allow(dead_code)]
 pub fn artcraft_mark(ui: &mut egui::Ui, size: f32) -> Response {
     ui.add(
         egui::Image::from_bytes("bytes://artcraft-mark.svg", include_bytes!("../../../docs/brand/artcraft-mark.svg"))
@@ -713,6 +741,7 @@ pub fn artcraft_mark(ui: &mut egui::Ui, size: f32) -> Response {
 
 /// Buttons for every community link (`pdfcraft_engine::links`), Discord first and prominent.
 /// Returns the registry command of the one clicked.
+#[allow(dead_code)]
 pub fn community_links(ui: &mut egui::Ui) -> Option<&'static str> {
     let mut clicked = None;
     ui.horizontal_wrapped(|ui| {

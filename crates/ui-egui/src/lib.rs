@@ -121,6 +121,7 @@ use dialogs::appearance;
 pub use dialogs::bookmark_styles_ui;
 use dialogs::comment_props;
 use dialogs::convert_colours_ui;
+#[cfg(test)]
 use dialogs::credits;
 use dialogs::hairlines_ui;
 use dialogs::marks_ui;
