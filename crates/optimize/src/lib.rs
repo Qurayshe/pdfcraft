@@ -38,16 +38,20 @@
 
 mod audit;
 mod external_refs;
+pub mod flatten;
 mod form_actions;
 pub mod fragments;
 mod images;
 mod links;
 mod pool;
 mod samples;
+pub mod target;
 mod tiles;
 mod unused;
 
 pub use audit::{SpaceCategory, SpaceUse, audit_space};
+pub use flatten::{TiledPage, detect_tiled_pages};
+pub use target::{LADDER, TargetOutcome, Trial, optimize_to_target};
 
 use pdfcraft_cos::{Dict, Document, ImageBudget, MAX_PAGE_DECODED, ObjRef, Object, Stream, serialize};
 use pdfcraft_filters::{Filter, Params};
@@ -130,6 +134,10 @@ pub enum Stage {
     Images { done: usize, total: usize },
     /// Merging the fragments of a page picture into one image (only when a page has some).
     Fragments,
+    /// Replacing tiled page `done` (0-based) of `total` with one picture (see [`flatten`]).
+    Flatten { done: usize, total: usize },
+    /// Trying the `n`th (1-based) of `of` size settings ([`optimize_to_target`]).
+    Trial { n: usize, of: usize },
     /// Discarding objects, cleaning up links and compressing unencoded streams.
     CleanUp,
 }
@@ -196,6 +204,33 @@ impl ImageSettings {
     /// The Mobile preset: bicubic to 96 ppi above 144 ppi, JPEG high quality. Pages read on a
     /// screen; text in scans stays legible.
     pub const MOBILE: ImageSettings = ImageSettings { downsample: true, target_ppi: 96.0, above_ppi: 144.0, compression: Compression::Jpeg(80) };
+    /// The Presentation preset: no resolution rule (a slide's page size says nothing about how
+    /// sharp it needs to be: see [`Settings::max_image_dimension`]), JPEG at quality 70.
+    pub const PRESENTATION: ImageSettings = ImageSettings { downsample: false, target_ppi: 96.0, above_ppi: 144.0, compression: Compression::Jpeg(70) };
+}
+
+/// Replace pages that are made of many image tiles with one picture each.
+///
+/// Slides exported from design tools often carry a page picture cut into hundreds of clipped
+/// patches over a background many times the screen's size. Each tile is too small to resample on
+/// its own, so no per-image setting helps. With this on, such a page is drawn without its text at
+/// `max_dimension` pixels along its longer side, the result is stored as one JPEG, and the text
+/// is put back over it as it was (still text: searchable, sharp at any zoom). See [`flatten`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FlattenSettings {
+    pub enabled: bool,
+    /// Fewest images a page draws to count as tiled.
+    pub min_images: usize,
+    /// Pixels along the longer side of the picture a tiled page becomes.
+    pub max_dimension: u32,
+    /// JPEG quality (1 to 100) of that picture.
+    pub quality: u8,
+}
+
+impl Default for FlattenSettings {
+    fn default() -> Self {
+        Self { enabled: false, min_images: 20, max_dimension: 1920, quality: 70 }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -206,10 +241,18 @@ pub struct Settings {
     pub workers: Option<usize>,
     /// Put page pictures drawn as many stacked fragments back together first ([`fragments`]).
     pub merge_fragments: bool,
+    /// Replace pages made of many image tiles with one picture each, text kept ([`flatten`]).
+    pub flatten_tiles: FlattenSettings,
     pub color: ImageSettings,
     pub gray: ImageSettings,
     /// Black-and-white images, image masks, and pictures' one-bit masks.
     pub mono: MonoSettings,
+    /// Longest side in pixels any colour or grey image may keep, regardless of page size
+    /// (1920 keeps 1080p presentations sharp while shrinking 4K and 8K artwork).
+    pub max_image_dimension: Option<u32>,
+    /// Also optimize JPEG 2000 images (`/JPXDecode`) and palette (`/Indexed`) images, which the
+    /// default Acrobat presets leave untouched.
+    pub extended_formats: bool,
     pub discard_thumbnails: bool,
     pub discard_alternate_images: bool,
     pub discard_tags: bool,
@@ -237,6 +280,9 @@ pub struct Settings {
     /// actions with an `/F`, out of links and bookmarks; a link left with nothing to do is
     /// removed. Links within the document and web links stay.
     pub discard_external_refs: bool,
+    /// Target file size in megabytes (e.g. 20.0). When set, the optimizer bisects the ladder of
+    /// image dimensions and qualities to produce the sharpest file that stays under this size.
+    pub target_mb: Option<f32>,
 }
 
 impl Settings {
@@ -254,9 +300,12 @@ impl Default for Settings {
             workers: None,
             compatibility: Compatibility::Retain,
             merge_fragments: true,
+            flatten_tiles: FlattenSettings::default(),
             color: ImageSettings::REDUCE,
             gray: ImageSettings::REDUCE,
             mono: MonoSettings::REDUCE,
+            max_image_dimension: None,
+            extended_formats: false,
             discard_thumbnails: true,
             discard_alternate_images: true,
             discard_tags: false,
@@ -269,6 +318,7 @@ impl Default for Settings {
             remove_invalid_links: true,
             remove_unreferenced_dests: true,
             discard_external_refs: false,
+            target_mb: None,
         }
     }
 }
@@ -280,16 +330,21 @@ pub enum Preset {
     Standard,
     /// Smaller files for reading on a phone or screen: images to 96 ppi above 144, JPEG high.
     Mobile,
+    /// Slide decks and portfolios drawn at screen size: pages made of many image tiles become one
+    /// picture each, images keep at most 1920 pixels along their longer side (JPEG 2000 and
+    /// palette images included), JPEG quality 70.
+    Presentation,
 }
 
 impl Preset {
-    pub const ALL: [Preset; 2] = [Preset::Standard, Preset::Mobile];
+    pub const ALL: [Preset; 3] = [Preset::Standard, Preset::Mobile, Preset::Presentation];
 
     /// The name tools use.
     pub fn name(self) -> &'static str {
         match self {
             Preset::Standard => "standard",
             Preset::Mobile => "mobile",
+            Preset::Presentation => "presentation",
         }
     }
 
@@ -301,6 +356,14 @@ impl Preset {
         match self {
             Preset::Standard => Settings::default(),
             Preset::Mobile => Settings { color: ImageSettings::MOBILE, gray: ImageSettings::MOBILE, ..Settings::default() },
+            Preset::Presentation => Settings {
+                color: ImageSettings::PRESENTATION,
+                gray: ImageSettings::PRESENTATION,
+                max_image_dimension: Some(1920),
+                extended_formats: true,
+                flatten_tiles: FlattenSettings { enabled: true, ..FlattenSettings::default() },
+                ..Settings::default()
+            },
         }
     }
 
@@ -316,10 +379,22 @@ pub struct Report {
     /// Images merged from fragments, and how many fragments went into them.
     pub merged_images: usize,
     pub fragments_merged: usize,
+    /// Pages found to be made of many image tiles, how many of those became one picture, how many
+    /// were left as they were (and why: see [`flatten::TiledPage::skip`]), and how many images
+    /// the pages drew before.
+    pub tiled_pages: usize,
+    pub pages_flattened: usize,
+    pub pages_not_flattened: usize,
+    pub tiles_flattened: usize,
     /// Images the image step read: those the pages draw, and their pictures' one-bit masks.
     pub images: usize,
     pub images_resampled: usize,
     pub images_recompressed: usize,
+    /// Images made smaller by the longest-side limit ([`Settings::max_image_dimension`]), JPEG
+    /// 2000 images and palette images optimized ([`Settings::extended_formats`]).
+    pub images_capped: usize,
+    pub jpx_images: usize,
+    pub palette_images: usize,
     /// Images left as they are: decoding them all would take more than one run may spend.
     pub images_refused: usize,
     /// Encoded image bytes before and after (images that changed).
@@ -371,6 +446,14 @@ pub fn optimize(doc: &mut Document, settings: &Settings) -> Result<Report, Optim
 /// during a long one). Returning `false` stops with [`OptimizeError::Cancelled`]; `doc` is then
 /// partly optimized and should be dropped.
 pub fn optimize_with_progress(doc: &mut Document, settings: &Settings, progress: &mut dyn FnMut(Stage) -> bool) -> Result<Report, OptimizeError> {
+    if let Some(target_mb) = settings.target_mb {
+        let target_bytes = (target_mb as f64 * 1024.0 * 1024.0).round() as u64;
+        let mut base = settings.clone();
+        base.target_mb = None;
+        let outcome = target::optimize_to_target(doc, &base, target_bytes, progress)?;
+        *doc = outcome.doc;
+        return Ok(outcome.report);
+    }
     // Lexical ordering is valid for these fixed versions with single-digit components.
     if let Some(chosen) = settings.compatibility.version()
         && let Some(required) = required_encryption_version(doc)
@@ -384,6 +467,9 @@ pub fn optimize_with_progress(doc: &mut Document, settings: &Settings, progress:
     let mut budget = ImageBudget::new(doc);
     if settings.merge_fragments {
         fragments::run(doc, &pages, &mut report, progress, &mut budget)?;
+    }
+    if settings.flatten_tiles.enabled {
+        flatten::run(doc, &settings.flatten_tiles, settings.workers, &mut report, progress)?;
     }
     images::run(doc, &pages, settings, &mut report, progress, &mut budget)?;
     if !progress(Stage::CleanUp) {

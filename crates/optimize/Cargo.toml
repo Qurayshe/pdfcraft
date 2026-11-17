@@ -16,17 +16,20 @@ pdfcraft-filters = { workspace = true }
 pdfcraft-content = { workspace = true }
 pdfcraft-model = { workspace = true }
 pdfcraft-annot = { workspace = true }
+# Flattening tiled pages renders them (the only way to composite clipped, layered tiles faithfully).
+pdfcraft-render = { workspace = true }
 thiserror.workspace = true
 # Bicubic resampling; zero codec features.
 image = { version = "0.25", default-features = false }
 # JPEG decoding and encoding via craft-libs.
 craft-jpeg = { workspace = true }
 craft-image-codecs = { workspace = true }
+# JPEG 2000 decoding, already in the workspace tree through hayro-syntax.
+hayro-jpeg2000 = "0.3.5"
 
 # Lets other programs go first while a copy is being made.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 thread-priority = "3.1"
 
 [dev-dependencies]
-pdfcraft-render = { workspace = true }
 proptest.workspace = true

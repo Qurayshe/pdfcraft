@@ -20,8 +20,12 @@ pub enum OptimizeStage {
     Reading { done: usize, total: usize },
     /// Merging the fragments of a page picture into one image.
     Fragments,
+    /// Rendering tiled presentation page `done` (0-based) of `total` as one picture.
+    Flattening { done: usize, total: usize },
     /// About to process image `done` (0-based) of `total`.
     Images { done: usize, total: usize },
+    /// Trying target-size setting `step` (1-based) of at most `total`.
+    Trial { step: usize, total: usize },
     /// Discarding objects and compressing unencoded streams.
     CleaningUp,
     /// Merging identical fonts and images.
@@ -44,7 +48,9 @@ impl OptimizeStage {
         match self {
             OptimizeStage::Discarding | OptimizeStage::Fragments => 0.0,
             OptimizeStage::Reading { done, total } => 0.25 * if total == 0 { 0.0 } else { part(done, total) },
+            OptimizeStage::Flattening { done, total } => 0.15 * part(done, total),
             OptimizeStage::Images { done, total } => 0.25 + 0.55 * part(done, total),
+            OptimizeStage::Trial { step, total } => (0.10 + 0.70 * part(step, total)).min(0.80),
             OptimizeStage::CleaningUp => 0.8,
             OptimizeStage::Merging => 0.85,
             OptimizeStage::Writing => 0.9,
@@ -118,14 +124,24 @@ impl OptimizeJob {
                 r => r?,
             }
         };
+        let mut active_trial: Option<(usize, usize)> = None;
         let report = optimize::optimize_with_progress(&mut cos, &settings, &mut |s| {
-            step(match s {
+            let stage = match s {
+                optimize::Stage::Trial { n, of } => {
+                    active_trial = Some((n, of));
+                    OptimizeStage::Trial { step: n, total: of }
+                }
+                _ if active_trial.is_some() => {
+                    let (step, total) = active_trial.unwrap_or((1, 1));
+                    OptimizeStage::Trial { step, total }
+                }
                 optimize::Stage::Reading { done, total } => OptimizeStage::Reading { done, total },
                 optimize::Stage::Fragments => OptimizeStage::Fragments,
+                optimize::Stage::Flatten { done, total } => OptimizeStage::Flattening { done, total },
                 optimize::Stage::Images { done, total } => OptimizeStage::Images { done, total },
                 optimize::Stage::CleanUp => OptimizeStage::CleaningUp,
-            })
-            .is_ok()
+            };
+            step(stage).is_ok()
         })
         .map_err(|e| match e {
             optimize::OptimizeError::Cancelled => EditError::Cancelled,

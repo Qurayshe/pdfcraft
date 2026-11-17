@@ -55,6 +55,16 @@ const MAX_FORM_DEPTH: usize = 12;
 /// Walks of a form already walked once (other scale or caller) before the measurement gives up.
 /// Each form's first walk is free: their number is bounded by the file's object count.
 const MAX_REWALKS: usize = 100_000;
+/// Most image draws one page walk records (memory); a page past it is not reported as tiled.
+const MAX_DRAWS: usize = 20_000;
+
+/// One drawing of an image: its bounding box in the page's user space.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Draw {
+    pub image: ObjRef,
+    /// `[x0, y0, x1, y1]`, the box of the unit square under the current matrix.
+    pub rect: [f64; 4],
+}
 
 /// State of one [`effective_resolutions`] pass.
 struct Walk<'a> {
@@ -79,6 +89,12 @@ struct Walk<'a> {
     /// The references the walk followed to reach its images, and the pages and page-tree nodes
     /// whose resources it read.
     read: Read,
+    /// Whether to record each draw rect (only needed by [`page_draws`]).
+    record_draws: bool,
+    /// Every image drawing seen, in drawing order (at most [`MAX_DRAWS`]).
+    draws: Vec<Draw>,
+    /// A form drawn holds text operators, so its text isn't in the page's own content.
+    form_text: bool,
 }
 
 /// Where a walk read a reference: under a name in an `/XObject` dictionary (an image or a form),
@@ -146,7 +162,14 @@ impl Walk<'_> {
                     match s.dict.name(b"Subtype") {
                         Some(b"Image") => {
                             let (w, h) = (s.dict.int(b"Width").unwrap_or(0) as f64, s.dict.int(b"Height").unwrap_or(0) as f64);
-                            let [a, b, c, d, ..] = top.0;
+                            let [a, b, c, d, e, f] = top.0;
+                            if self.record_draws && self.draws.len() < MAX_DRAWS {
+                                let xs = [e, a + e, c + e, a + c + e];
+                                let ys = [f, b + f, d + f, b + d + f];
+                                let lo = |v: &[f64; 4]| v.iter().copied().fold(f64::INFINITY, f64::min);
+                                let hi = |v: &[f64; 4]| v.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                                self.draws.push(Draw { image: r, rect: [lo(&xs), lo(&ys), hi(&xs), hi(&ys)] });
+                            }
                             let (sx, sy) = ((a * a + b * b).sqrt(), (c * c + d * d).sqrt());
                             if w > 0.0 && h > 0.0 && sx > 1e-6 && sy > 1e-6 {
                                 let ppi = (w / (sx / 72.0)).min(h / (sy / 72.0));
@@ -230,6 +253,9 @@ impl Walk<'_> {
             self.complete = false;
             return;
         };
+        if self.record_draws && data.windows(2).any(|w| w == b"BT") {
+            self.form_text = true;
+        }
         self.path.push(r);
         match &own {
             Some(own) => {
@@ -253,6 +279,45 @@ impl Walk<'_> {
 fn remaps_device_spaces(doc: &Document, resources: &Dict) -> bool {
     let spaces = resources.get(b"ColorSpace").map(|c| doc.resolve(c));
     spaces.as_deref().and_then(Object::as_dict).is_some_and(|c| c.contains(b"DefaultGray") || c.contains(b"DefaultRGB"))
+}
+
+/// The images `page` draws, in drawing order, with where each lands (user space).
+pub(crate) struct PageDraws {
+    pub draws: Vec<Draw>,
+    /// A form the page draws holds text.
+    pub form_text: bool,
+    /// Every drawing was found (no form nested too deeply, no content unreadable).
+    pub complete: bool,
+}
+
+/// Every image drawing of `page` with its box in user space.
+pub(crate) fn page_draws(doc: &Document, page: ObjRef) -> PageDraws {
+    let mut walk = Walk {
+        doc,
+        path: Vec::new(),
+        walked: HashSet::new(),
+        seen: HashSet::new(),
+        rewalks: 0,
+        budget: DecodeBudget::page(),
+        complete: true,
+        out: HashMap::new(),
+        defaults: HashSet::new(),
+        read: Read::default(),
+        record_draws: true,
+        draws: Vec::new(),
+        form_text: false,
+    };
+    if let Some(dict) = doc.get(page).as_dict().cloned()
+        && let Some(contents) = dict.get(b"Contents")
+    {
+        let (res, holder) = held_page_resources(doc, page).unwrap_or_else(|| (Dict::default(), page));
+        if let Some(data) = content_bytes(doc, contents, &mut walk.budget) {
+            walk.content(&data, &res, holder, Matrix([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]), false);
+        } else {
+            walk.complete = false;
+        }
+    }
+    PageDraws { draws: walk.draws, form_text: walk.form_text, complete: walk.complete }
 }
 
 /// The effective resolution (ppi) of every image drawn by `pages`: the smallest over its uses.
@@ -286,6 +351,9 @@ fn walk_pages(doc: &Document, pages: &[ObjRef], tick: &mut dyn FnMut(usize) -> b
         out: HashMap::new(),
         defaults: HashSet::new(),
         read: Read::default(),
+        record_draws: false,
+        draws: Vec::new(),
+        form_text: false,
     };
     for (done, p) in pages.iter().enumerate() {
         if !tick(done) {
@@ -710,9 +778,22 @@ pub(crate) fn decodable(doc: &Document, s: &Stream) -> Option<bool> {
 /// Whether `decode` is the default decode array for `n` components ([0 1] each), which changes
 /// nothing. Scanners write it on page images (#490).
 pub(crate) fn is_identity_decode(doc: &Document, decode: &Object, n: usize) -> bool {
+    is_identity_decode_range(doc, decode, n, 1.0)
+}
+
+/// Whether `decode` is the default decode array for `n` components (`[0 hi_expected]` each).
+fn is_identity_decode_range(doc: &Document, decode: &Object, n: usize, hi_expected: f64) -> bool {
     let decode = doc.resolve(decode);
     let Some(a) = decode.as_array() else { return false };
-    a.len() == 2 * n && a.chunks(2).all(|p| matches!(p, [lo, hi] if doc.resolve(lo).as_f64() == Some(0.0) && doc.resolve(hi).as_f64() == Some(1.0)))
+    a.len() == 2 * n
+        && a.chunks(2).all(|p| {
+            matches!(
+                p,
+                [lo, hi]
+                    if doc.resolve(lo).as_f64() == Some(0.0)
+                        && doc.resolve(hi).as_f64() == Some(hi_expected)
+            )
+        })
 }
 
 /// A new image stream from 8-bit samples: the original dictionary with the new size and filter.
@@ -721,7 +802,7 @@ pub(crate) fn is_identity_decode(doc: &Document, decode: &Object, n: usize) -> b
 /// Adobe marker, which is what a missing /ColorTransform means.
 fn image_stream(old: &Dict, px: &[u8], n: usize, w: u32, h: u32, compression: Compression, was_dct: bool) -> Option<Stream> {
     let mut d = old.clone();
-    for k in [&b"Filter"[..], b"DecodeParms", b"Decode", b"Length", b"DL"] {
+    for k in [&b"Filter"[..], b"DecodeParms", b"Decode", b"Length", b"DL", b"SMaskInData"] {
         d.remove(k);
     }
     d.set(b"Width".to_vec(), Object::Int(w as i64));
@@ -745,50 +826,226 @@ fn image_stream(old: &Dict, px: &[u8], n: usize, w: u32, h: u32, compression: Co
     }
 }
 
+/// How an image's samples are read: its component count once decoded, and the codec or colour
+/// space that needs more than [`pixels`]. Images PdfCraft only reads when
+/// `Settings::extended_formats` is on (JPEG 2000, palette images) get a kind of their own.
+#[derive(Clone)]
+pub(crate) struct Desc {
+    pub n: usize,
+    kind: Kind,
+}
+
+#[derive(Clone)]
+enum Kind {
+    /// 8-bit grey or RGB in a codec [`pixels`] decodes.
+    Plain,
+    /// JPEG 2000 (`/JPXDecode`).
+    Jpx,
+    /// A palette (`/Indexed`) image: `bpc` bits per index, `palette` holds `n` bytes per entry.
+    Indexed { base: Object, palette: Vec<u8>, hival: usize, bpc: usize },
+}
+
+/// Whether `s` is a JPEG 2000 image: `/JPXDecode` as its only filter.
+fn is_jpx(s: &Stream) -> bool {
+    match s.dict.get(b"Filter") {
+        Some(Object::Name(n)) => n.as_slice() == b"JPXDecode",
+        Some(Object::Array(a)) => matches!(a.as_slice(), [Object::Name(n)] if n.as_slice() == b"JPXDecode"),
+        _ => false,
+    }
+}
+
+/// The `/Indexed` colour space `cs`: its base space, palette bytes and highest index.
+fn indexed_palette(doc: &Document, cs: &Object) -> Option<(Object, Vec<u8>, usize)> {
+    let cs = doc.resolve(cs);
+    let a = cs.as_array()?;
+    if !matches!(a.first()?.as_name()?, b"Indexed" | b"I") {
+        return None;
+    }
+    let base = a.get(1)?.clone();
+    let hival = usize::try_from(doc.resolve(a.get(2)?).as_int()?).ok().filter(|h| *h <= 255)?;
+    let n = components(doc, &base)?;
+    let lookup = doc.resolve(a.get(3)?);
+    let palette = match &*lookup {
+        Object::String(s) if s.bytes.len() <= MAX_PALETTE => s.bytes.to_vec(),
+        Object::Stream(st) if st.raw.len() <= 4 * MAX_PALETTE => doc.with_direct_parms(st).decoded_within(MAX_PALETTE).ok()?,
+        _ => return None,
+    };
+    (palette.len() >= (hival + 1).checked_mul(n)?).then_some((base, palette, hival))
+}
+
+/// The channel count and size of a JPEG 2000 image with no alpha channel, from its header.
+fn jpx_header(raw: &[u8]) -> Option<(usize, u32, u32)> {
+    use hayro_jpeg2000::{ColorSpace, DecodeSettings, Image};
+    let img = Image::new(raw, &DecodeSettings::default()).ok()?;
+    if img.has_alpha() {
+        return None;
+    }
+    let n = match img.color_space() {
+        ColorSpace::Gray => 1,
+        ColorSpace::RGB => 3,
+        ColorSpace::Icc { num_channels, .. } if matches!(num_channels, 1 | 3) => usize::from(*num_channels),
+        _ => return None,
+    };
+    Some((n, img.width(), img.height()))
+}
+
+/// How `s` is read, or `None` when it can't be: grey and RGB in a codec PdfCraft decodes, and
+/// with `extended` also JPEG 2000 and palette images.
+pub(crate) fn describe(doc: &Document, s: &Stream, extended: bool) -> Option<Desc> {
+    let cs = s.dict.get(b"ColorSpace");
+    if let Some(n) = cs.and_then(|cs| components(doc, cs)) {
+        return Some(Desc { n, kind: if extended && is_jpx(s) { Kind::Jpx } else { Kind::Plain } });
+    }
+    if !extended {
+        return None;
+    }
+    match cs {
+        Some(cs) => {
+            let (base, palette, hival) = indexed_palette(doc, cs)?;
+            let bpc = usize::try_from(s.dict.int(b"BitsPerComponent")?).ok().filter(|b| matches!(b, 1 | 2 | 4 | 8))?;
+            let n = components(doc, &base)?;
+            Some(Desc { n, kind: Kind::Indexed { base, palette, hival, bpc } })
+        }
+        // A JPEG 2000 image without /ColorSpace takes the codestream's.
+        None if is_jpx(s) => Some(Desc { n: jpx_header(&s.raw)?.0, kind: Kind::Jpx }),
+        None => None,
+    }
+}
+
+/// 8-bit samples of an image read as `desc` says within `budget`.
+fn samples(doc: &Document, s: &Stream, desc: &Desc, budget: &mut ImageBudget) -> Option<Vec<u8>> {
+    let (w, h) = (u32::try_from(s.dict.int(b"Width")?).ok()?, u32::try_from(s.dict.int(b"Height")?).ok()?);
+    match &desc.kind {
+        Kind::Plain => pixels(doc, s, desc.n, budget),
+        Kind::Jpx => {
+            use hayro_jpeg2000::{DecodeSettings, Image};
+            let (n, jw, jh) = jpx_header(&s.raw)?;
+            if w == 0 || h == 0 || n != desc.n || (jw, jh) != (w, h) || u64::from(w) * u64::from(h) > MAX_PIXELS {
+                return None;
+            }
+            let bytes = usize::try_from(w).ok()?.checked_mul(usize::try_from(h).ok()?)?.checked_mul(n)?;
+            if !budget.pay_jpeg(u64::try_from(bytes).ok()?, &s.raw) {
+                return None;
+            }
+            let px = Image::new(&s.raw, &DecodeSettings::default()).ok()?.decode().ok()?;
+            count_decoded(u64::from(w) * u64::from(h));
+            (px.len() == bytes).then_some(px)
+        }
+        Kind::Indexed { palette, hival, bpc, .. } => {
+            if w == 0 || h == 0 || u64::from(w) * u64::from(h) > MAX_PIXELS {
+                return None;
+            }
+            let (wu, hu, n) = (usize::try_from(w).ok()?, usize::try_from(h).ok()?, desc.n);
+            let row = wu.checked_mul(*bpc)?.div_ceil(8);
+            let need = row.checked_mul(hu)?;
+            let data = budget.decode_filters(doc, s, allowance(need, h)?).ok()?;
+            if data.len() < need {
+                return None;
+            }
+            count_decoded(u64::from(w) * u64::from(h));
+            let mut out = Vec::with_capacity(wu.checked_mul(hu)?.checked_mul(n)?);
+            let per_byte = 8 / bpc;
+            let mask = (1usize << bpc) - 1;
+            for y in 0..hu {
+                let line = data.get(y * row..(y + 1) * row)?;
+                for x in 0..wu {
+                    let byte = usize::from(*line.get(x / per_byte)?);
+                    let shift = 8 - bpc * (x % per_byte + 1);
+                    let idx = ((byte >> shift) & mask).min(*hival);
+                    out.extend_from_slice(palette.get(idx * n..idx * n + n)?);
+                }
+            }
+            Some(out)
+        }
+    }
+}
+
+/// One image optimized: the new image, its new soft mask, and what was done to it.
+struct Processed {
+    new: Stream,
+    smask: Option<(ObjRef, Stream)>,
+    capped: bool,
+    jpx: bool,
+    palette: bool,
+}
+
 /// Whether a `/Mask` value is a stencil mask: an image that says `/ImageMask true`.
 fn is_stencil(doc: &Document, mask: &Object) -> bool {
     matches!(&*doc.resolve(mask), Object::Stream(s) if matches!(s.dict.get(b"ImageMask"), Some(Object::Bool(true))))
 }
 
-/// One image: resample and/or recompress per `settings`; `ppi` is its effective resolution.
+/// One image: resample and/or recompress per `settings`; `ppi` is its effective resolution and
+/// `cap` the longest side (in pixels) an image may keep.
 /// Returns the new image and its new soft mask, if the result is smaller.
 fn process(
     doc: &Document,
     s: &Stream,
     ppi: f64,
     settings: &ImageSettings,
-    n: usize,
+    desc: &Desc,
+    cap: Option<u32>,
     budget: &mut ImageBudget,
-) -> Option<(Stream, Option<(ObjRef, Stream)>)> {
+) -> Option<Processed> {
     let d = &s.dict;
+    let n = desc.n;
+    let palette = matches!(desc.kind, Kind::Indexed { .. });
+    let jpx = matches!(desc.kind, Kind::Jpx);
+    let bad_decode = match &desc.kind {
+        Kind::Indexed { bpc, .. } => {
+            let max = ((1u32 << bpc) - 1) as f64;
+            d.get(b"Decode").is_some_and(|a| !is_identity_decode_range(doc, a, 1, max))
+        }
+        _ => d.get(b"Decode").is_some_and(|a| !is_identity_decode(doc, a, n)),
+    };
     // A colour-key mask names sample values, which resampling and JPEG would change. A stencil mask
     // is an image of its own, with its own resolution (ISO 32000-2 §8.9.6.3): the picture can change
     // under it and its edges stay as they are.
-    if d.get(b"Decode").is_some_and(|a| !is_identity_decode(doc, a, n))
+    if bad_decode
         || d.get(b"Mask").is_some_and(|m| !is_stencil(doc, m))
         || d.name(b"ImageMask").is_some()
         || matches!(d.get(b"ImageMask"), Some(Object::Bool(true)))
+        || (jpx && d.int(b"SMaskInData").unwrap_or(0) != 0)
     {
         return None;
     }
-    if d.int(b"BitsPerComponent") != Some(8) {
+    if matches!(desc.kind, Kind::Plain) && d.int(b"BitsPerComponent") != Some(8) {
         return None;
     }
-    let was_dct = is_dct(s)?;
+    let was_dct = match desc.kind {
+        Kind::Plain => is_dct(s)?,
+        Kind::Jpx => true,
+        // A palette image is never JPEG (its samples are indices); one stored so is left alone.
+        Kind::Indexed { .. } => {
+            if is_dct(s)? {
+                return None;
+            }
+            false
+        }
+    };
     let (w, h) = (u32::try_from(d.int(b"Width")?).ok()?, u32::try_from(d.int(b"Height")?).ok()?);
     if w == 0 || h == 0 || (w as u64) * (h as u64) > MAX_PIXELS {
         return None;
     }
-    let resize = settings.downsample && ppi.is_finite() && ppi > settings.above_ppi && settings.target_ppi > 0.0 && settings.target_ppi.is_finite();
+    let by_ppi = settings.downsample && ppi.is_finite() && ppi > settings.above_ppi && settings.target_ppi > 0.0 && settings.target_ppi.is_finite();
+    let cap = cap.filter(|m| *m > 0);
+    let by_cap = cap.is_some_and(|m| w.max(h) > m);
+    let resize = by_ppi || by_cap;
     let recompress = matches!(settings.compression, Compression::Jpeg(_)) || (matches!(settings.compression, Compression::Flate) && was_dct);
-    let (nw, nh) = if resize {
+    let (mut nw, mut nh) = (w, h);
+    if by_ppi {
         // Downsampling never enlarges: a target above the image's own resolution (or a hostile
         // settings value) must not size a buffer from the setting.
         let k = (settings.target_ppi / ppi).min(1.0);
-        (((w as f64 * k).round() as u32).max(1), ((h as f64 * k).round() as u32).max(1))
-    } else {
-        (w, h)
-    };
+        nw = ((w as f64 * k).round() as u32).max(1);
+        nh = ((h as f64 * k).round() as u32).max(1);
+    }
+    if let Some(m) = cap
+        && nw.max(nh) > m
+    {
+        let k = f64::from(m) / f64::from(nw.max(nh));
+        nw = ((f64::from(nw) * k).round() as u32).max(1);
+        nh = ((f64::from(nh) * k).round() as u32).max(1);
+    }
     // A target at or above the image's own resolution resizes nothing.
     let resize = resize && (nw, nh) != (w, h);
     if !resize && !recompress {
@@ -798,9 +1055,17 @@ fn process(
     if !resize && (w as u64) * (h as u64) < 64 * 64 {
         return None;
     }
-    let px = pixels(doc, s, n, budget)?;
+    let px = samples(doc, s, desc, budget)?;
     let px = if (nw, nh) != (w, h) { resample(&px, n, w, h, nw, nh)? } else { px };
-    let new = image_stream(d, &px, n, nw, nh, settings.compression, was_dct)?;
+    // Palette samples are written as the palette's base colour space; a JPEG 2000 stream without
+    // one gets the device space its channels name.
+    let mut dict = d.clone();
+    match &desc.kind {
+        Kind::Indexed { base, .. } => dict.set(b"ColorSpace".to_vec(), base.clone()),
+        _ if !dict.contains(b"ColorSpace") => dict.set(b"ColorSpace".to_vec(), Object::name(if n == 1 { "DeviceGray" } else { "DeviceRGB" })),
+        _ => {}
+    }
+    let new = image_stream(&dict, &px, n, nw, nh, settings.compression, was_dct)?;
     // A soft mask must keep the image's dimensions: resample it with the image (lossless).
     let mut smask = None;
     if let Some(mr) = d.reference(b"SMask") {
@@ -822,7 +1087,13 @@ fn process(
             _ => 0,
         });
     let after = new.raw.len() + smask.as_ref().map_or(0, |(_, m)| m.raw.len());
-    (after < before).then_some((new, smask))
+    (after < before).then_some(Processed {
+        new,
+        smask,
+        capped: by_cap && (nw, nh) != (w, h),
+        jpx,
+        palette,
+    })
 }
 
 /// Whether colour space `cs` has one colour component, so a 1-bit image in it has one bit per
@@ -1582,7 +1853,17 @@ fn decide_mask(doc: &Document, r: ObjRef, settings: &Settings, budget: &mut Imag
     // Its resolution unmeasured, it isn't resampled. As where a default colour space is in force:
     // at one bit a sample that changes nothing, and nothing is packed.
     match mono(doc, s, f64::NAN, true, &settings.mono, budget) {
-        Some((new, _, _)) => Decision::Replace { image: r, before: s.raw.len(), new, resampled: false, smask: None, bits: None },
+        Some((new, _, _)) => Decision::Replace {
+            image: r,
+            before: s.raw.len(),
+            new,
+            resampled: false,
+            smask: None,
+            bits: None,
+            capped: false,
+            jpx: false,
+            palette: false,
+        },
         None => Decision::Stays { refused: budget.refused() > refused },
     }
 }
@@ -1678,19 +1959,22 @@ enum Decision {
         smask: Option<(ObjRef, Stream)>,
         /// Its 1-bit samples, if it may share a JBIG2 dictionary ([`share`]).
         bits: Option<Vec<u8>>,
+        capped: bool,
+        jpx: bool,
+        palette: bool,
     },
 }
 
 /// Do what was decided for one picture, and count it.
 fn apply(doc: &mut Document, decision: Decision, report: &mut Report, jbig2: &mut bool, group: &mut Vec<Held>) {
-    let (image, before, new, resampled, smask, bits) = match decision {
+    let (image, before, new, resampled, smask, bits, capped, jpx, palette) = match decision {
         Decision::NotAnImage => return,
         Decision::Stays { refused } => {
             report.images += 1;
             report.images_refused += usize::from(refused);
             return;
         }
-        Decision::Replace { image, before, new, resampled, smask, bits } => (image, before, new, resampled, smask, bits),
+        Decision::Replace { image, before, new, resampled, smask, bits, capped, jpx, palette } => (image, before, new, resampled, smask, bits, capped, jpx, palette),
     };
     report.images += 1;
     *jbig2 |= new.dict.name(b"Filter") == Some(b"JBIG2Decode");
@@ -1701,6 +1985,9 @@ fn apply(doc: &mut Document, decision: Decision, report: &mut Report, jbig2: &mu
     } else {
         report.images_recompressed += 1;
     }
+    report.images_capped += usize::from(capped);
+    report.jpx_images += usize::from(jpx);
+    report.palette_images += usize::from(palette);
     let side = |key: &[u8]| new.dict.int(key).and_then(|v| u32::try_from(v).ok());
     let held = bits.zip(side(b"Width")).zip(side(b"Height"));
     doc.set(image, Object::Stream(new));
@@ -1727,10 +2014,12 @@ fn decide(doc: &Document, r: ObjRef, ppi: f64, defaults: bool, settings: &Settin
     };
     if let Some((new, resampled, bits)) = mono {
         let bits = bits.filter(|_| shares(&new.dict));
-        return Decision::Replace { image: r, before: s.raw.len(), new, resampled, smask: None, bits };
+        return Decision::Replace { image: r, before: s.raw.len(), new, resampled, smask: None, bits, capped: false, jpx: false, palette: false };
     }
-    let n = s.dict.get(b"ColorSpace").and_then(|cs| components(doc, cs));
-    let processed = n.and_then(|n| process(doc, s, ppi, if n == 1 { &settings.gray } else { &settings.color }, n, budget));
+    let desc = describe(doc, s, settings.extended_formats);
+    let processed = desc
+        .as_ref()
+        .and_then(|d| process(doc, s, ppi, if d.n == 1 { &settings.gray } else { &settings.color }, d, settings.max_image_dimension, budget));
     // A dithered scan, say, downsampled and JPEG-compressed: the smaller wins, counting a soft
     // mask resampled with it.
     let smask_len = |smask: Option<&(ObjRef, Stream)>| match smask {
@@ -1742,18 +2031,18 @@ fn decide(doc: &Document, r: ObjRef, ppi: f64, defaults: bool, settings: &Settin
     };
     let total = |new: &Stream, smask: Option<&(ObjRef, Stream)>| Some(crate::stored_len(new)?.saturating_add(smask_len(smask).unwrap_or(0)));
     let packed_wins = packed.as_ref().is_some_and(|(p, _, _)| {
-        processed.as_ref().is_none_or(|(new, smask)| total(p, None).zip(total(new, smask.as_ref())).is_some_and(|(a, b)| a <= b))
+        processed.as_ref().is_none_or(|pr| total(p, None).zip(total(&pr.new, pr.smask.as_ref())).is_some_and(|(a, b)| a <= b))
     });
     if let Some((new, resampled, bits)) = packed.filter(|_| packed_wins) {
         let bits = bits.filter(|_| shares(&new.dict));
-        return Decision::Replace { image: r, before: s.raw.len(), new, resampled, smask: None, bits };
+        return Decision::Replace { image: r, before: s.raw.len(), new, resampled, smask: None, bits, capped: false, jpx: false, palette: false };
     }
-    let Some((new, smask)) = processed else {
+    let Some(pr) = processed else {
         // Read to be packed and again to be resampled, it is still one image, and it stayed.
         return Decision::Stays { refused: budget.refused() > refused };
     };
-    let resampled = new.dict.int(b"Width") != s.dict.int(b"Width") || new.dict.int(b"Height") != s.dict.int(b"Height");
-    Decision::Replace { image: r, before: s.raw.len(), new, resampled, smask, bits: None }
+    let resampled = pr.new.dict.int(b"Width") != s.dict.int(b"Width") || pr.new.dict.int(b"Height") != s.dict.int(b"Height");
+    Decision::Replace { image: r, before: s.raw.len(), new: pr.new, resampled, smask: pr.smask, bits: None, capped: pr.capped, jpx: pr.jpx, palette: pr.palette }
 }
 
 /// JBIG2Decode is PDF 1.4: a document whose header says less, and whose catalog doesn't say 1.4
@@ -2425,7 +2714,7 @@ mod dimension_tests {
         with_mask.dict.set(b"SMask".to_vec(), Object::Ref(masked));
         let spent = |s: &Stream| {
             let mut budget = ImageBudget::with_work(u64::MAX);
-            process(&doc, s, 720.0, &Settings::default().gray, 1, &mut budget).expect("resampled, and smaller");
+            process(&doc, s, 720.0, &Settings::default().gray, &Desc { n: 1, kind: Kind::Plain }, None, &mut budget).expect("resampled, and smaller");
             u64::MAX - budget.work_left()
         };
         assert_eq!(spent(&with_mask), spent(&image("DeviceGray")) + cost);
